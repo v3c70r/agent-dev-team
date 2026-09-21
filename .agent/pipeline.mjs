@@ -33,10 +33,23 @@ const STATE_FILE = path.join(AGENT, 'state.json');
 const LOG_DIR = path.join(AGENT, 'logs');
 const TMP = path.join(AGENT, 'tmp');
 const LABEL_APPROVED = 'agent-approved';
-// default branch auto-detected (main/master); override with AGENT_BASE
-const BASE = process.env.AGENT_BASE
-  || sh(['git', 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD']).replace(/^origin\//, '')
-  || 'master';
+// default branch auto-detected (main/master); override with AGENT_BASE.
+// NOTE: `refs/remotes/origin/HEAD` is often MISSING on fresh clones (e.g. after
+// `gh repo create --source=. --push`), so never let detection throw at import time.
+function detectBase() {
+  if (process.env.AGENT_BASE) return process.env.AGENT_BASE;
+  const tryOut = (args) => { try { return sh(args).trim(); } catch { return ''; } };
+  const sym = tryOut(['git', 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD']).replace(/^origin\//, '');
+  if (sym) return sym;
+  for (const cand of ['main', 'master']) {
+    if (tryOut(['git', 'rev-parse', '--verify', `origin/${cand}`])) return cand;
+  }
+  const ls = tryOut(['git', 'ls-remote', '--symref', 'origin', 'HEAD']);
+  const m = ls.match(/^ref:\s+refs\/heads\/(\S+)\s+HEAD/m);
+  if (m) return m[1];
+  return 'master';
+}
+const BASE = detectBase();
 
 // ── upstream feedback (self-improvement of the agent-dev-team skill) ──
 // .agent/config.json: { "upstream": "<owner>/<repo>", "feedbackOptIn": true }

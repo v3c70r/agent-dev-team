@@ -168,3 +168,25 @@ PR 仍不可见时保存 `pr: null` 并留待下一轮，不崩溃。
 内真正执行**；窗口跨午夜的判断专门写了单元测试（9 个时间点全通过）。
 
 **教训**：跨午夜的区间判断极易写错（`16.5–24.5` 这类表示法），务必单测。
+
+---
+
+## 14. 新仓库没有 `origin/HEAD`，默认分支探测在模块加载时崩溃
+
+**现象**：刚用 `gh repo create --source=. --push` 建好的仓库，一启动 supervisor 就
+`fatal: ref refs/remotes/origin/HEAD is not a symbolic ref`，进程 exit 1，
+supervisor 每 10s 重启一次（死循环）。
+
+**根因**：默认分支探测直接 `sh(['git','symbolic-ref','--short','refs/remotes/origin/HEAD'])`，
+而 `sh()` 在命令失败时抛异常；且新克隆/新建仓库常常**没有** `origin/HEAD` 符号引用。
+异常发生在**模块顶层**，所以连 `status` 子命令都跑不起来。
+
+**修复**（`detectBase()`，多级降级且绝不抛异常）：
+1. `AGENT_BASE` 环境变量
+2. `git symbolic-ref refs/remotes/origin/HEAD`
+3. 探测 `origin/main` / `origin/master` 是否存在
+4. `git ls-remote --symref origin HEAD`（需要网络，放最后）
+5. 兜底 `master`
+
+**教训**：**模块顶层不要执行可能失败的外部命令**（尤其是 `sh()` 这种会抛异常的封装）；
+自动探测必须提供多级降级与兜底值。这条是 dogfood 第一天就撞出来的。
