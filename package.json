@@ -6,6 +6,7 @@
   "scripts": {
     "build": "node scripts/validate.mjs",
     "test": "node scripts/validate.mjs",
+    "doctor": "node scripts/doctor.mjs",
     "agent:watch": "node .agent/pipeline.mjs watch",
     "agent:status": "node .agent/pipeline.mjs status",
     "sync:agent": "node scripts/sync-agent.mjs"

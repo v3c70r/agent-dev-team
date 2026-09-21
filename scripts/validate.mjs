@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // validate.mjs — the maintenance repo's own "build + test" (dogfooded by Agent C).
 // Checks: syntax of all mjs/sh, SKILL.md frontmatter, template completeness,
-// and that the live .agent/ copies match templates/ (no drift).
+// doctor self-check, and that the live .agent/ copies match templates/ (no drift).
 import { execFileSync } from 'node:child_process';
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
@@ -13,7 +13,7 @@ const fail = (m) => { console.error('✗ ' + m); failures++; };
 const ok = (m) => console.log('✓ ' + m);
 
 // 1. node --check every .mjs
-for (const f of ['templates/pipeline.mjs', 'templates/pm/run.mjs', 'scripts/validate.mjs']) {
+for (const f of ['templates/pipeline.mjs', 'templates/lib.mjs', 'templates/pm/run.mjs', 'scripts/validate.mjs', 'scripts/doctor.mjs']) {
   try { execFileSync('node', ['--check', path.join(ROOT, f)], { stdio: 'pipe' }); ok(`syntax ${f}`); }
   catch (e) { fail(`syntax ${f}: ${e.stderr}`); }
 }
@@ -34,7 +34,7 @@ for (const f of ['templates/supervisor.sh', 'templates/pm/supervisor.sh', 'templ
 
 // 4. required templates exist
 const REQUIRED = [
-  'templates/issue-agent.yml', 'templates/pipeline.mjs', 'templates/supervisor.sh',
+  'templates/issue-agent.yml', 'templates/pipeline.mjs', 'templates/lib.mjs', 'templates/supervisor.sh',
   'templates/prompts/implementer.md', 'templates/prompts/reviewer.md',
   'templates/pm/run.mjs', 'templates/pm/prompt.md', 'templates/pm/supervisor.sh',
   'templates/config.json', 'templates/gitignore.snippet',
@@ -52,6 +52,7 @@ for (const f of REQUIRED) existsSync(path.join(ROOT, f)) ? ok(`exists ${f}`) : f
 // 6. no drift: live .agent/ files must match templates/ (dogfood discipline)
 const PAIRS = [
   ['templates/pipeline.mjs', '.agent/pipeline.mjs'],
+  ['templates/lib.mjs', '.agent/lib.mjs'],
   ['templates/supervisor.sh', '.agent/supervisor.sh'],
   ['templates/prompts/implementer.md', '.agent/prompts/implementer.md'],
   ['templates/prompts/reviewer.md', '.agent/prompts/reviewer.md'],
@@ -73,6 +74,17 @@ for (const [t, live] of PAIRS) {
   const r = readFileSync(path.join(ROOT, 'templates/prompts/reviewer.md'), 'utf8');
   if (!r.includes('RESULT: APPROVE')) fail('reviewer prompt lost the machine-readable verdict rule');
   else ok('reviewer verdict sentinel present');
+}
+
+// 8. doctor dogfood self-check: `npm run doctor` must be green in THIS repo
+{
+  try {
+    execFileSync('node', [path.join(ROOT, 'scripts/doctor.mjs')], { cwd: ROOT, encoding: 'utf8', stdio: 'pipe' });
+    ok('doctor green');
+  } catch (e) {
+    const out = [e.stdout, e.stderr].filter(Boolean).join('\n').trim();
+    fail(`doctor not green:\n${out}`);
+  }
 }
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} FAILURE(S)`);

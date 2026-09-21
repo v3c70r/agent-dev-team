@@ -24,16 +24,12 @@ PM Agent（可选，定时折扣时段）──▶ 竞品调研 ──▶ 提案
 
 ## 第一步：Preflight（开始前必须逐项确认）
 
-```bash
-gh auth status                 # 已登录，scopes 含 repo + workflow
-which pi && pi --version       # pi 在 PATH（>= 0.85）
-which tmux                     # tmux 存在
-node --version                 # >= 18
-git remote -v                  # 当前仓库已关联 GitHub remote
-```
+先运行 `npm run doctor`，按输出逐项修复，**全绿（0 退出）再继续**。
+若目标仓库尚未安装该脚本，可在目标仓库目录下运行
+`node <agent-dev-team 技能目录>/scripts/doctor.mjs`（它会自检当前目录所在仓库）。
 
 同时确认（决定 Agent C 如何工作）：
-- 仓库的构建/测试命令（读 package.json scripts：`build` / `test`）
+- 仓库的构建/测试命令（doctor 会检查 `package.json` scripts 的 `build` / `test`）
 - 若测试需要密钥（如地图 token）：存在哪个 env 文件？测试用 `TEST_ENV_FILE` 注入
 - 若仓库没有任何测试：警告用户"Agent C 将只跑 build"，建议先补测试
 
@@ -61,6 +57,7 @@ git remote -v                  # 当前仓库已关联 GitHub remote
 |---|---|---|
 | `.github/workflows/issue-agent.yml` | `templates/issue-agent.yml` | `{{GITHUB_OWNER}}` → 通知账号 |
 | `.agent/pipeline.mjs` | `templates/pipeline.mjs` | 无需改（env 可覆盖） |
+| `.agent/lib.mjs` | `templates/lib.mjs` | 无需改 |
 | `.agent/prompts/implementer.md` | `templates/prompts/implementer.md` | 无需改 |
 | `.agent/prompts/reviewer.md` | `templates/prompts/reviewer.md` | 无需改 |
 | `.agent/supervisor.sh` | `templates/supervisor.sh` | 无需改 |
