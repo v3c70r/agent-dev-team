@@ -47,6 +47,67 @@ function reviewModel() {
     model: process.env.REVIEW_MODEL || cfg.review?.model || 'glm-5.3',
   };
 }
+function reviewFallbackModel() {
+  const cfg = loadConfig();
+  return {
+    provider: process.env.REVIEW_FALLBACK_PROVIDER || cfg.reviewFallback?.provider || '',
+    model: process.env.REVIEW_FALLBACK_MODEL || cfg.reviewFallback?.model || '',
+  };
+}
+
+function modelName(rv) {
+  if (rv.provider && rv.model) return `${rv.provider}/${rv.model}`;
+  if (rv.provider) return `${rv.provider}/(default model)`;
+  if (rv.model) return `(default provider)/${rv.model}`;
+  return '(pi default)';
+}
+
+// One real 1-token call; on failure retry ONCE so transient network jitter
+// doesn't get misread as a billing/quota outage (issue #5).
+function probePi(rv) {
+  const args = ['-p', '--mode', 'text',
+    ...(rv.provider ? ['--provider', rv.provider] : []),
+    ...(rv.model ? ['--model', rv.model] : []),
+    '--no-session', '--no-tools', '--no-approve', '--thinking', 'off',
+    'Reply with exactly: OK'];
+  const bin = resolvePi();
+  const attempt = () => execFileSync(bin, args, {
+    cwd: ROOT, encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+  let out;
+  try {
+    out = attempt();
+    return { ok: true, retried: false, out };
+  } catch (e1) {
+    const firstErr = String((e1.stderr || e1.stdout || e1.message) || '').trim();
+    try {
+      out = attempt();
+      return { ok: true, retried: true, out };
+    } catch (e2) {
+      const err = String((e2.stderr || e2.stdout || e2.message) || '').trim() || firstErr;
+      return { ok: false, retried: true, error: err };
+    }
+  }
+}
+
+function evaluateProbe(rv, envPrefix, extraFix) {
+  const name = modelName(rv);
+  const res = probePi(rv);
+  if (res.ok) {
+    if (!res.out) {
+      return { status: 'fail', detail: `${name} 探针返回空输出`, fix: `确认 ${envPrefix}_PROVIDER / ${envPrefix}_MODEL 有效且账户可用（lessons #2）` };
+    }
+    const retryNote = res.retried ? '（已重试后成功）' : '';
+    return { status: 'pass', detail: `${name} 探针成功${retryNote}（返回 "${res.out.slice(0, 40)}"）` };
+  }
+  const brief = (res.error || '').replace(/\s+/g, ' ').slice(0, 160);
+  const quota = /\b429\b|insufficient|balance|quota|无可用资源|余额不足|欠费|rate.?limit|too many requests|capacity|overload/i.test(res.error || '');
+  const retryNote = '（已重试 1 次仍失败）';
+  if (quota) {
+    return { status: 'fail', detail: `${name} 额度/限流探测失败${retryNote}：${brief}`, fix: `为账户充值，或设置 ${envPrefix}_PROVIDER / ${envPrefix}_MODEL 指向可用模型${extraFix}` };
+  }
+  return { status: 'fail', detail: `${name} 探测失败${retryNote}：${brief}`, fix: `确认 ${envPrefix}_PROVIDER / ${envPrefix}_MODEL 指向有效模型且已登录（\`pi auth check --provider <x>\` 显示 ready）` };
+}
 
 // ── checks ──
 const CHECKS = [
@@ -150,26 +211,17 @@ const CHECKS = [
   {
     name: '模型可用性',
     run() {
-      const rv = reviewModel();
-      const name = `${rv.provider}/${rv.model}`;
-      const bin = resolvePi();
-      try {
-        const out = execFileSync(bin, ['-p', '--mode', 'text',
-          '--provider', rv.provider, '--model', rv.model,
-          '--no-session', '--no-tools', '--no-approve', '--thinking', 'off',
-          'Reply with exactly: OK'],
-          { cwd: ROOT, encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-        if (!out) return { status: 'fail', detail: `${name} 探针返回空输出`, fix: '确认 REVIEW_MODEL 有效且账户可用（lessons #2）' };
-        return { status: 'pass', detail: `${name} 探针成功（返回 "${out.slice(0, 40)}"）` };
-      } catch (e) {
-        const err = String((e.stderr || e.stdout || e.message) || '').trim();
-        const brief = err.replace(/\s+/g, ' ').slice(0, 160);
-        const quota = /\b429\b|insufficient|balance|quota|无可用资源|余额不足|欠费|rate.?limit|too many requests|capacity|overload/i.test(err);
-        if (quota) {
-          return { status: 'fail', detail: `${name} 额度/限流探测失败：${brief}`, fix: '为账户充值，或设置 REVIEW_PROVIDER / REVIEW_MODEL 指向可用模型（也可配置 reviewFallback 兜底）' };
-        }
-        return { status: 'fail', detail: `${name} 探测失败：${brief}`, fix: '确认 REVIEW_PROVIDER / REVIEW_MODEL 指向有效模型且已登录（`pi auth check --provider <x>` 显示 ready）' };
+      const results = [evaluateProbe(reviewModel(), 'REVIEW', '（也可配置 reviewFallback 兜底）')];
+      const fb = reviewFallbackModel();
+      if (!fb.provider && !fb.model) {
+        results.push({ status: 'pass', detail: '未配置回退模型，已跳过' });
+      } else {
+        results.push(evaluateProbe(fb, 'REVIEW_FALLBACK', '（回退模型需与主模型同样可用）'));
       }
+      const failed = results.filter(r => r.status === 'fail');
+      const detail = results.map(r => r.detail).join('；');
+      if (failed.length) return { status: 'fail', detail, fix: failed.map(r => r.fix).filter(Boolean).join(' | ') };
+      return { status: 'pass', detail };
     },
   },
   {
