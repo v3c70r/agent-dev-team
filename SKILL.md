@@ -57,6 +57,7 @@ PM Agent（可选，定时折扣时段）──▶ 竞品调研 ──▶ 提案
 |---|---|---|
 | `.github/workflows/issue-agent.yml` | `templates/issue-agent.yml` | `{{GITHUB_OWNER}}` → 通知账号 |
 | `.agent/pipeline.mjs` | `templates/pipeline.mjs` | 无需改（env 可覆盖） |
+| `.agent/lib.mjs` | `templates/lib.mjs` | 无需改 |
 | `.agent/prompts/implementer.md` | `templates/prompts/implementer.md` | 无需改 |
 | `.agent/prompts/reviewer.md` | `templates/prompts/reviewer.md` | 无需改 |
 | `.agent/supervisor.sh` | `templates/supervisor.sh` | 无需改 |
