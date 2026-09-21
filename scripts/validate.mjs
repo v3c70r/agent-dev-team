@@ -87,5 +87,21 @@ for (const [t, live] of PAIRS) {
   }
 }
 
+// 9. tester comment must not hardcode a test framework (对外宣称必须与实际执行一致)
+{
+  const pipe = readFileSync(path.join(ROOT, 'templates/pipeline.mjs'), 'utf8');
+  if (pipe.includes('Playwright')) fail('templates/pipeline.mjs still hardcodes Playwright');
+  else ok('tester comment generic (no Playwright)');
+}
+
+// 10. doctor probes main + fallback with one retry and skips unconfigured fallback
+{
+  const doc = readFileSync(path.join(ROOT, 'scripts/doctor.mjs'), 'utf8');
+  for (const token of ['reviewFallbackModel', '已重试', '未配置回退模型，已跳过']) {
+    if (doc.includes(token)) ok(`doctor ${token}`);
+    else fail(`doctor missing "${token}"`);
+  }
+}
+
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);

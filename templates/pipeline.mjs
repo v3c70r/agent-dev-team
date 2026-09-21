@@ -5,7 +5,7 @@
 //  Roles:
 //    A implementer  — reads approved issue, implements, opens PR
 //    B reviewer     — reviews PR diff, posts comments, discusses w/ A
-//    C tester       — builds & runs Playwright on the PR branch, merges
+//    C tester       — builds & runs the repo's build/test scripts, merges
 //
 //  Shared memory:  PR comments (GitHub) + .agent/logs/issue-<N>.md
 //  Trigger:        issue labelled `agent-approved` by GitHub Actions triage
@@ -229,7 +229,7 @@ function runTester(issueNum, prNum, branch) {
     sh(['npm', 'run', 'build'], { cwd: wt });
     const report = sh(['npm', 'test'], { cwd: wt }).split('\n').slice(-60).join('\n');
     log(issueNum, `C: 测试通过 ✅\n${report}`);
-    commentOnPr(prNum, `🤖 **Agent C 功能测试通过** ✅（build + Playwright）`);
+    commentOnPr(prNum, `🤖 **Agent C 功能测试通过** ✅（构建 + 测试套件通过）`);
     return { pass: true };
   } catch (e) {
     const report = (e.stdout || e.message || '').split('\n').slice(-60).join('\n');
