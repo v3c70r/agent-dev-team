@@ -3,11 +3,11 @@
   "feedbackOptIn": true,
   "review": {
     "provider": "zai-coding-cn",
-    "model": "glm-5.3"
+    "model": "glm-5.3-flash"
   },
   "reviewFallback": {
-    "provider": "",
-    "model": ""
+    "provider": "deepseek",
+    "model": "deepseek-v4-pro"
   },
   "notes": "review / reviewFallback 为空则用 env 或内置默认；env 优先级最高。feedbackOptIn=false 可关闭自我提升反馈"
 }

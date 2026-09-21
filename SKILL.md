@@ -38,7 +38,8 @@ PM Agent（可选，定时折扣时段）──▶ 竞品调研 ──▶ 提案
 ## 第二步：询问用户配置（用 ask_user_question 或逐条确认）
 
 1. **Agent B 审查模型**：建议与实现模型**不同厂商**（独立视角、降低自我确认偏差）。
-   例如实现=deepseek-v4-pro，审查=glm-5.3。需要该 provider 已配置（`pi auth check --provider <x>`）。
+   例如实现=deepseek-v4-pro，审查=glm-5.3（更便宜的档位：`glm-5.3-flash`）。
+   注意 `pi auth check` **不检测余额**；`npm run doctor` 已内置模型可用性探针（对审查模型做 1-token 真实调用），或启用 `reviewFallback` 兜底。
 2. **PM Agent**：是否安装？若安装：每日运行时刻（UTC，建议落在所用模型的折扣时段，如
    DeepSeek 为 16:30–00:30 UTC）；每日/每周提案上限（默认 1/天、5/周）。
    PM 需要联网调研：是否安装 brave-search 技能（需 `BRAVE_API_KEY`）？
