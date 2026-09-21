@@ -190,3 +190,45 @@ supervisor 每 10s 重启一次（死循环）。
 
 **教训**：**模块顶层不要执行可能失败的外部命令**（尤其是 `sh()` 这种会抛异常的封装）；
 自动探测必须提供多级降级与兜底值。这条是 dogfood 第一天就撞出来的。
+
+---
+
+## 15. 审查模型欠费/限流会让整个 issue 卡死
+
+**现象**：Agent A 正常实现并开了 PR，审查阶段直接 `needs_human`，state.error 里是
+`429 {"code":"1113","message":"余额不足或无可用资源包,请充值。"}`。
+人工介入前，该 issue 完全无法推进。且 `pi auth check --provider <x>` 仍显示 `ready`
+（它只验证凭证存在，**不检测余额/额度**）。
+
+**根因**：`runPi()` 抛出的异常直接冒泡到"每-issue catch"，被当成不可恢复错误。
+
+**修复**（模板内置）：
+1. `isModelUnavailable()`：识别 `429 / insufficient / balance / quota / 余额不足 / rate limit / overload`；
+2. 命中时**自动回退**到 `REVIEW_FALLBACK_PROVIDER/MODEL`（默认空 = pi 默认模型）完成本轮审查；
+3. 在 PR 上留明确评论（哪个模型不可用、错误摘要、已回退到谁、长期方案）；
+4. 调用 `reportGap()` 上报上游（opt-in），并在建议里点名 doctor 的预检缺口。
+
+**教训**：外部依赖（模型额度）必须在**编排层**做降级，而不是让异常直通终态；
+另外"凭证有效"≠"服务可用"，健康检查要对齐真实失败模式。
+
+---
+
+## 16. 反馈机制自己坏了：调用了不存在的 helper（悬空引用）
+
+**现象**：首次真正需要上报 skill 缺口时，日志只有一行
+`[feedback] failed: ghJson is not defined` —— 反馈 issue 从未创建。
+
+**根因**：`reportGap()` 里用了 `ghJson(...)`，但 `pipeline.mjs` 只定义了 `gh()`
+（`ghJson` 当时只存在于 `pm/run.mjs`）。异常被 `reportGap` 的 try/catch 吞掉，
+**静默失效**——最坏的一种失败。
+
+**修复**：补上 `ghJson = (args) => JSON.parse(gh(args))`；并新增
+`node .agent/pipeline.mjs feedback "<title>" [body]` 手动上报入口，
+便于随时验证通道可用（而非等事故发生才发现它坏了）。
+
+**教训**：
+- 兜底/遥测代码必须**被测试过**，否则它只是"看起来有"；
+- 静默 catch 会掩盖关键路径故障，至少要 `console.warn` 出可观测信号；
+- 同一类问题在本项目出现过两次（本条与 Agent B 抓到的 `lib.mjs` 漏配）——
+  **重构后要全局搜索悬空引用**（`grep -n "ghJson\|lib.mjs" 等`），这也正是
+  独立模型审查的价值所在。
