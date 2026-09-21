@@ -1,6 +1,13 @@
 {
   "upstream": "v3c70r/agent-dev-team",
   "feedbackOptIn": true,
-  "review": { "provider": "", "model": "" },
-  "notes": "review 为空则用 .agent/pipeline.mjs 内置默认；feedbackOptIn=false 可随时关闭自我提升反馈"
+  "review": {
+    "provider": "",
+    "model": ""
+  },
+  "notes": "review / reviewFallback 为空则用 env 或内置默认；env 优先级最高。feedbackOptIn=false 可关闭自我提升反馈",
+  "reviewFallback": {
+    "provider": "",
+    "model": ""
+  }
 }

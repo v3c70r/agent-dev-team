@@ -186,7 +186,7 @@ async function runReviewRound(issueNum, prNum) {
     out = runPi(`agent-review-${prNum}`, prompt, null, REVIEW);
   } catch (err) {
     if (!isModelUnavailable(err)) throw err;
-    const fallback = { provider: process.env.REVIEW_FALLBACK_PROVIDER || '', model: process.env.REVIEW_FALLBACK_MODEL || '' };
+    const fallback = REVIEW_FALLBACK;
     const detail = String((err.stderr || err.message || '')).slice(0, 300);
     console.warn(`[review] ${describeModel(REVIEW)} unavailable → fallback ${describeModel(fallback)}: ${detail}`);
     log(issueNum, `B: 模型不可用（${describeModel(REVIEW)}）→ 回退到 ${describeModel(fallback)}`);
@@ -247,9 +247,15 @@ function runTester(issueNum, prNum, branch) {
 // ── model routing per role ──
 // Agent A (implementer) uses pi's default model unless IMPL_PROVIDER/IMPL_MODEL are set.
 // Agent B (reviewer) uses a different model for an independent perspective.
+// model routing: env wins, then .agent/config.json, then built-in defaults
+const CFG_JSON = loadConfig();
 const REVIEW = {
-  provider: process.env.REVIEW_PROVIDER || 'zai-coding-cn',
-  model: process.env.REVIEW_MODEL || 'glm-5.3',
+  provider: process.env.REVIEW_PROVIDER || CFG_JSON.review?.provider || 'zai-coding-cn',
+  model: process.env.REVIEW_MODEL || CFG_JSON.review?.model || 'glm-5.3',
+};
+const REVIEW_FALLBACK = {
+  provider: process.env.REVIEW_FALLBACK_PROVIDER || CFG_JSON.reviewFallback?.provider || '',
+  model: process.env.REVIEW_FALLBACK_MODEL || CFG_JSON.reviewFallback?.model || '',
 };
 const IMPL = {
   provider: process.env.IMPL_PROVIDER || '',
