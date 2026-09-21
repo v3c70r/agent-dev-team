@@ -26,6 +26,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, copyFileSync, symlinkSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { detectBase, resolvePi, sh } from './lib.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const AGENT = path.join(ROOT, '.agent');
@@ -33,22 +34,6 @@ const STATE_FILE = path.join(AGENT, 'state.json');
 const LOG_DIR = path.join(AGENT, 'logs');
 const TMP = path.join(AGENT, 'tmp');
 const LABEL_APPROVED = 'agent-approved';
-// default branch auto-detected (main/master); override with AGENT_BASE.
-// NOTE: `refs/remotes/origin/HEAD` is often MISSING on fresh clones (e.g. after
-// `gh repo create --source=. --push`), so never let detection throw at import time.
-function detectBase() {
-  if (process.env.AGENT_BASE) return process.env.AGENT_BASE;
-  const tryOut = (args) => { try { return sh(args).trim(); } catch { return ''; } };
-  const sym = tryOut(['git', 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD']).replace(/^origin\//, '');
-  if (sym) return sym;
-  for (const cand of ['main', 'master']) {
-    if (tryOut(['git', 'rev-parse', '--verify', `origin/${cand}`])) return cand;
-  }
-  const ls = tryOut(['git', 'ls-remote', '--symref', 'origin', 'HEAD']);
-  const m = ls.match(/^ref:\s+refs\/heads\/(\S+)\s+HEAD/m);
-  if (m) return m[1];
-  return 'master';
-}
 const BASE = detectBase();
 
 // ── upstream feedback (self-improvement of the agent-dev-team skill) ──
@@ -76,31 +61,7 @@ function reportGap(title, body) {
   } catch (e) { console.warn('[feedback] failed:', e.message); }
 }
 
-// ── locate the real pi binary ──
-// `npm run` prepends node_modules/.bin to PATH, and a transitive dep also
-// ships a (much older) `pi` CLI that shadows the real one. Skip those dirs.
-let PI_BIN = null;
-function resolvePi() {
-  if (PI_BIN) return PI_BIN;
-  if (process.env.PI_BIN) { PI_BIN = process.env.PI_BIN; return PI_BIN; }
-  const dirs = (process.env.PATH || '').split(path.delimiter)
-    .filter(d => d && !d.includes('node_modules'));
-  for (const d of dirs) {
-    const c = path.join(d, 'pi');
-    if (existsSync(c)) { PI_BIN = c; return PI_BIN; }
-  }
-  PI_BIN = 'pi';
-  return PI_BIN;
-}
-
 // ── tiny helpers ──
-function sh(cmd, opts = {}) {
-  const out = execFileSync(cmd[0], cmd.slice(1), {
-    cwd: opts.cwd || ROOT, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
-    ...opts.shell !== undefined ? {} : {},
-  });
-  return out.trim();
-}
 function gh(args, opts = {}) {
   return sh(['gh', ...args], opts);
 }

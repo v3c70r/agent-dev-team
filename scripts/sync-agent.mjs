@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PAIRS = [
   ['templates/pipeline.mjs', '.agent/pipeline.mjs'],
+  ['templates/lib.mjs', '.agent/lib.mjs'],
   ['templates/supervisor.sh', '.agent/supervisor.sh'],
   ['templates/prompts/implementer.md', '.agent/prompts/implementer.md'],
   ['templates/prompts/reviewer.md', '.agent/prompts/reviewer.md'],
