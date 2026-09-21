@@ -36,6 +36,18 @@ const displayWidth = (s) => {
 };
 const pad = (s, n) => { let out = String(s); while (displayWidth(out) < n) out += ' '; return out; };
 
+// Review-model routing mirrors templates/pipeline.mjs: env wins, then .agent/config.json, then built-in default.
+function loadConfig() {
+  try { return JSON.parse(readFileSync(path.join(ROOT, '.agent/config.json'), 'utf8')); } catch { return {}; }
+}
+function reviewModel() {
+  const cfg = loadConfig();
+  return {
+    provider: process.env.REVIEW_PROVIDER || cfg.review?.provider || 'zai-coding-cn',
+    model: process.env.REVIEW_MODEL || cfg.review?.model || 'glm-5.3',
+  };
+}
+
 // ── checks ──
 const CHECKS = [
   {
@@ -133,6 +145,31 @@ const CHECKS = [
       const missing = required.filter(r => !txt.includes(r));
       if (missing.length) return { status: 'fail', detail: `缺少忽略规则: ${missing.join(', ')}`, fix: '把 templates/gitignore.snippet 里的运行时规则写全（lessons #9）' };
       return { status: 'pass', detail: '包含全部必需运行时忽略规则' };
+    },
+  },
+  {
+    name: '模型可用性',
+    run() {
+      const rv = reviewModel();
+      const name = `${rv.provider}/${rv.model}`;
+      const bin = resolvePi();
+      try {
+        const out = execFileSync(bin, ['-p', '--mode', 'text',
+          '--provider', rv.provider, '--model', rv.model,
+          '--no-session', '--no-tools', '--no-approve', '--thinking', 'off',
+          'Reply with exactly: OK'],
+          { cwd: ROOT, encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+        if (!out) return { status: 'fail', detail: `${name} 探针返回空输出`, fix: '确认 REVIEW_MODEL 有效且账户可用（lessons #2）' };
+        return { status: 'pass', detail: `${name} 探针成功（返回 "${out.slice(0, 40)}"）` };
+      } catch (e) {
+        const err = String((e.stderr || e.stdout || e.message) || '').trim();
+        const brief = err.replace(/\s+/g, ' ').slice(0, 160);
+        const quota = /\b429\b|insufficient|balance|quota|无可用资源|余额不足|欠费|rate.?limit|too many requests|capacity|overload/i.test(err);
+        if (quota) {
+          return { status: 'fail', detail: `${name} 额度/限流探测失败：${brief}`, fix: '为账户充值，或设置 REVIEW_PROVIDER / REVIEW_MODEL 指向可用模型（也可配置 reviewFallback 兜底）' };
+        }
+        return { status: 'fail', detail: `${name} 探测失败：${brief}`, fix: '确认 REVIEW_PROVIDER / REVIEW_MODEL 指向有效模型且已登录（`pi auth check --provider <x>` 显示 ready）' };
+      }
     },
   },
   {
