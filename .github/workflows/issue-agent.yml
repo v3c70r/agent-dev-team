@@ -1,0 +1,111 @@
+name: Issue Agent Triage
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # every 10 minutes (safety net)
+  workflow_dispatch:          # manual trigger for testing
+  issues:
+    types: [opened, edited, reopened]
+  issue_comment:
+    types: [created]          # react instantly to /approve or /reject
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/github-script@v7
+        id: triage
+        with:
+          script: |
+            const BOT = 'github-actions[bot]';
+            const TARGET = 'v3c70r'; // account to @mention for approval (replaced at install)
+            const SEEN = 'agent-seen';
+            const APPROVED = 'agent-approved';
+            const REJECTED = 'agent-rejected';
+
+            // Guard: never re-process our own bot comments (prevents self-trigger loops)
+            if (context.payload.comment && context.payload.comment.user.login === BOT) {
+              console.log('bot-authored comment, skip');
+              return;
+            }
+
+            async function ensureLabel(issue, name, color) {
+              const has = (issue.labels || []).some(l => l.name === name);
+              if (!has) {
+                try {
+                  await github.rest.issues.addLabels({
+                    owner, repo, issue_number: issue.number, labels: [name]
+                  });
+                } catch (e) { core.warning('label ' + name + ': ' + e.message); }
+              }
+            }
+            const { owner, repo } = context.repo;
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', sort: 'created', direction: 'asc', per_page: 30
+            });
+
+            let touched = [];
+            for (const issue of issues) {
+              if (issue.pull_request) continue; // ignore PRs
+              const labels = (issue.labels || []).map(l => l.name);
+
+              // ── fetch comments (incl. issue body as pseudo-comment for /approve)
+              const { data: comments } = await github.rest.issues.listComments({
+                owner, repo, issue_number: issue.number, per_page: 100
+              });
+              const bodies = [
+                issue.body || '',
+                ...comments.map(c => c.body || '')
+              ].map(b => b.trim());
+
+              const approve = bodies.some(b => /^\/approve\b/i.test(b));
+              const reject = bodies.some(b => /^\/reject\b/i.test(b));
+
+              // 1) explicit /reject → tag and stop
+              if (reject && !labels.includes(REJECTED)) {
+                await ensureLabel(issue, REJECTED, '#6e7681');
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: issue.number,
+                  body: `@${TARGET} 已标记为不予实现（/reject）。本 issue 将不再被 agent 接管。`
+                });
+                touched.push('#' + issue.number + ' rejected');
+                continue;
+              }
+
+              // 2) /approve → tag, notify that local pipeline will pick up
+              if (approve && !labels.includes(APPROVED)) {
+                await ensureLabel(issue, APPROVED, '#0a7d32');
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: issue.number,
+                  body: `@${TARGET} ✅ 已批准 #${issue.number}。本地 agent pipeline 启动后将自动开始实现（` +
+                        '创建分支 → 实现 → PR）。若想取消，回复 `/reject`。'
+                });
+                touched.push('#' + issue.number + ' approved');
+                continue;
+              }
+
+              // 3) brand-new issue with no decision → notify user to approve or reject
+              if (!labels.includes(SEEN) && !labels.includes(APPROVED) && !labels.includes(REJECTED)) {
+                await ensureLabel(issue, SEEN, '#d4a72c');
+                const title = issue.title.slice(0, 80);
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: issue.number,
+                  body: `🤖 **Agent 检测到新 issue**：_${title}_\n\n` +
+                        `@${TARGET} 这是一个值得实现的改动吗？\n\n` +
+                        `- 回复 \`/approve\` → agent 开始实现（自动开 PR）\n` +
+                        `- 回复 \`/reject\` → 跳过\n`
+                });
+                touched.push('#' + issue.number + ' notified');
+              }
+            }
+
+            core.setOutput('touched', touched.join(', ') || '(none)');
+            console.log('touched:', touched.join(', '));

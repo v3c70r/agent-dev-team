@@ -1,0 +1,5 @@
+{
+  "upstream": "v3c70r/agent-dev-team",
+  "feedbackOptIn": true,
+  "review": { "provider": "zai-coding-cn", "model": "glm-5.3" }
+}

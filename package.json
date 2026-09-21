@@ -1,0 +1,14 @@
+{
+  "name": "agent-dev-team",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "A multi-agent development team (implementer/reviewer/tester/PM) orchestrated via GitHub issues & PRs — as a reusable skill",
+  "scripts": {
+    "build": "node scripts/validate.mjs",
+    "test": "node scripts/validate.mjs",
+    "agent:watch": "node .agent/pipeline.mjs watch",
+    "agent:status": "node .agent/pipeline.mjs status",
+    "sync:agent": "node scripts/sync-agent.mjs"
+  },
+  "license": "MIT"
+}

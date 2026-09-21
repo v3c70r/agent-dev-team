@@ -1,0 +1,10 @@
+# ── agent-dev-team runtime (never commit these) ──
+.agent/state.json
+.agent/logs/
+.agent/tmp/
+.agent/**/*.log
+.agent/pm/state.json
+.agent/pm/logs/
+.agent/pm/context.md
+.agent/pm/wt/
+.env
