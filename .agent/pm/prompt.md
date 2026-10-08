@@ -95,9 +95,22 @@ for the convention). Add label `enhancement` as well if appropriate.
 ## 5. Finish
 
 Before finishing, record in `docs/product-review.md`:
-- directions you considered and rejected this run ("已评估但不建议"), and
+- directions **you** considered and rejected this run ("已评估但不建议"), and
 - open questions for future runs ("待调研问题")
-so you do not re-propose them tomorrow.
+
+## 6. 必须遵守筛选器的审计结论（`docs/proposal-audit.md`）
+
+该文件由**筛选 agent**维护、append-only，是你的提案的正/负反馈记录。它在你的上下文包
+（`.agent/pm/context.md`）里已被注入，**不要修改这个文件**，只需遵守：
+
+- **REJECT 小节 = 不要重复提案**。即使换个措辞、换个角度，只要是同一方向就算重复。
+  唯一例外：你有**新证据**（新调研、新的用户反馈、新的代码事实），并且必须在提案正文里
+  明确写出"先前 #N 被拒的原因 X，现因证据 Y 而不同"。
+- **SPLIT 小节 = 允许重提，但必须按给出的拆分方案以更小范围提**。不得退回原来的大范围。
+  例如审计写"拆成 A/B/C"，你可以提 A（独立可验证），而不是再提 ABC 合体。
+- 若你的候选提案与审计中任何条目方向相近，**优先提出该方向中最小、最可验证的那一步**。
+
+这比"自己觉得没提过"更严格：审计是独立评估者的判断，与你的自我判断互为制衡。
 
 Also: while working, if you notice a **gap in the agent-dev-team machinery
 itself** (the multi-agent loop you are part of — templates, prompts, pipeline),

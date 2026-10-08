@@ -143,6 +143,17 @@ function buildContext() {
     parts.push('\n## Previously proposed pm-proposal issues\n' + (d.map(i => `- #${i.number} [${i.state}] ${i.title}`).join('\n') || '(none)') + '\n');
   } catch {}
 
+  // ── 筛选器审计（强制注入，避免重复提案 / 大范围重提）──
+  try {
+    const audit = readFileSync(path.join(ROOT, 'docs', 'proposal-audit.md'), 'utf8').trim();
+    if (audit) {
+      parts.push('\n## 提案审计（筛选器的结论，必须遵守）\n' +
+        '- REJECT 小节 = **不要再提**（除非你有新的证据，且必须在提案里明确引用新证据）\n' +
+        '- SPLIT 小节 = **可以提，但必须按给出的拆分方案以更小范围提**（不得回到原大范围）\n\n' +
+        '```\n' + audit.slice(0, 6000) + '\n```\n');
+    }
+  } catch { /* no audit yet */ }
+
   const out = parts.join('\n');
   writeFileSync(CONTEXT_FILE, out);
   return out;

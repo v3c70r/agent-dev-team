@@ -54,7 +54,4 @@ SWE-agent、Devin 类托管 agent、GitHub Copilot coding agent、CodeRabbit 类
 - 如何让"审查发现率"可量化（用于证明独立模型审查的价值）？
 - 无测试仓库如何自动生成最小测试（Agent C 的兜底）？
 
-
-## 已评估但不建议（由筛选 agent 维护，避免重复提案）
-
-- 2026-10-08 **#8 把整套文档翻译成 10 种语言** → 筛选判定 REJECT：提案零证据 —— 只有"可能有用"，没引用任何用户反馈/issue/调研数据；`docs/product-review.md` 把瓶颈列为"发现性/分发（无 marketplace）"，多语言文档不是已识别的杠杆。范围严重超限：仓库现有文档共 718 行（README 118 / SKILL.md 167 / docs/*.md 433），×10 语言 ≈ 60 个新文件、~7000 行，远超 Agent B 经验阈值（≤10 文件 / ≤600 行），审查质量必然崩。且翻译保真度**无任何自动验证手段**：`scripts/validate.mjs` 现有检查只有语法/SKILL frontmatter/模板存在性/`.agent`↔`templates` 无漂移/doctor 绿，无 i18n 校验；Agent C 无法判定 10 种语言译文正确性。收益 < 成本。
+## 已评估但不建议（PM 自己的判断；筛选器审计见 docs/proposal-audit.md）
