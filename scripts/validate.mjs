@@ -80,11 +80,14 @@ for (const [t, live] of PAIRS) {
 }
 
 // 8. doctor dogfood self-check: `npm run doctor` must be green in THIS repo
+// (its stdout is reused by check 11 so we only pay for the slow model probe once)
+let doctorHumanOut = '';
 {
   try {
-    execFileSync('node', [path.join(ROOT, 'scripts/doctor.mjs')], { cwd: ROOT, encoding: 'utf8', stdio: 'pipe' });
+    doctorHumanOut = execFileSync('node', [path.join(ROOT, 'scripts/doctor.mjs')], { cwd: ROOT, encoding: 'utf8', stdio: 'pipe' });
     ok('doctor green');
   } catch (e) {
+    doctorHumanOut = String(e.stdout || '');
     const out = [e.stdout, e.stderr].filter(Boolean).join('\n').trim();
     fail(`doctor not green:\n${out}`);
   }
@@ -104,6 +107,44 @@ for (const [t, live] of PAIRS) {
     if (doc.includes(token)) ok(`doctor ${token}`);
     else fail(`doctor missing "${token}"`);
   }
+}
+
+// 11. doctor --json: machine-readable output for CI / scripts (issue #7)
+{
+  const runDoctor = (args) => {
+    try {
+      return { out: execFileSync('node', [path.join(ROOT, 'scripts/doctor.mjs'), ...args], { cwd: ROOT, encoding: 'utf8', stdio: 'pipe' }), code: 0 };
+    } catch (e) {
+      return { out: String(e.stdout || ''), code: e.status };
+    }
+  };
+  const { out: jsonOut, code } = runDoctor(['--json']);
+  let data;
+  try { data = JSON.parse(jsonOut); } catch (e) { data = null; fail(`doctor --json 输出不是合法 JSON: ${e.message}`); }
+  if (data) {
+    const problems = [];
+    if (!Array.isArray(data.checks) || data.checks.length === 0) problems.push('checks 不是非空数组');
+    else for (const c of data.checks) {
+      if (typeof c.name !== 'string' || !c.name) problems.push('check 缺 name');
+      if (!['pass', 'warn', 'fail'].includes(c.status)) problems.push(`check ${c.name} status 非法: ${c.status}`);
+      if (typeof c.detail !== 'string') problems.push(`check ${c.name} 缺 detail`);
+    }
+    const s = data.summary;
+    if (!s || !['pass', 'fail', 'warn'].every(k => Number.isInteger(s[k]))) problems.push('summary 缺整数 pass/fail/warn');
+    else {
+      if (s.pass + s.fail + s.warn !== data.checks.length) problems.push('summary 计数之和 != checks.length');
+      // exit code must be 0 iff there are no failing checks (issue #7 acceptance).
+      // Covers both regressions: exits 0 despite failures, and non-zero despite all pass.
+      const codeOk = code === 0 ? s.fail === 0 : code > 0 && s.fail > 0;
+      if (!codeOk) problems.push(`doctor --json 退出码 ${code} 与 fail 数 ${s.fail} 不符`);
+    }
+    if (typeof data.ok !== 'boolean') problems.push('ok 不是布尔值');
+    else if (data.ok !== (data.summary?.fail === 0)) problems.push('ok 与 summary.fail 不一致');
+    problems.length ? fail(`doctor --json schema: ${problems.join('; ')}`) : ok('doctor --json schema');
+  }
+  const markers = ['🔍 agent-dev-team doctor', '结果：', '─'.repeat(80)];
+  const missing = markers.filter(m => !doctorHumanOut.includes(m));
+  missing.length ? fail(`doctor 人类表格输出回归（缺: ${missing.join(' / ')}）`) : ok('doctor 人类表格输出未回归');
 }
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} FAILURE(S)`);

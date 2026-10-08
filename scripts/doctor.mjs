@@ -253,6 +253,8 @@ const CHECKS = [
 ];
 
 // ── render + exit ──
+const jsonMode = process.argv.slice(2).includes('--json');
+
 const results = CHECKS.map((c) => {
   try { return { name: c.name, ...c.run() }; }
   catch (e) { return { name: c.name, status: 'fail', detail: `异常: ${e.message}`, fix: '见上方错误信息' }; }
@@ -263,6 +265,17 @@ for (const r of results) {
   if (r.status === 'pass') pass++;
   else if (r.status === 'warn') warn++;
   else fail++;
+}
+
+if (jsonMode) {
+  // Machine-readable output for CI / scripts (issue #7). Shape:
+  // { ok, checks: [{ name, status, detail, fix }], summary: { pass, fail, warn } }
+  console.log(JSON.stringify({
+    ok: fail === 0,
+    checks: results.map(r => ({ name: r.name, status: r.status, detail: r.detail, fix: r.fix ?? null })),
+    summary: { pass, fail, warn },
+  }, null, 2));
+  process.exit(fail > 0 ? 1 : 0);
 }
 
 console.log('\n🔍 agent-dev-team doctor — 环境自检');

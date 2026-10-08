@@ -56,6 +56,7 @@ pi 会按 [`SKILL.md`](SKILL.md) 的步骤：做 preflight 检查 → 询问你�
 | 看实现流水线 | `tmux attach -t agent`（Ctrl-b 然后 d 脱离） |
 | 看 PM Agent | `tmux attach -t pm` |
 | 状态机 | `npm run agent:status` |
+| 环境自检 | `npm run doctor`（人类表格）；`npm run --silent doctor -- --json` 输出 JSON（CI / 脚本消费，含 `checks` 与 `summary`；npm banner 走 stdout，故管道解析需 `--silent`） |
 | 单独复审某个 PR | `node .agent/pipeline.mjs review --pr 12 --issue 7` |
 | PM 调度/名额 | `node .agent/pm/run.mjs --check` |
 | PM 演练（不建 issue） | `node .agent/pm/run.mjs --dry-run --force` |
