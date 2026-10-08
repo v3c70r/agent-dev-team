@@ -6,5 +6,6 @@
 .agent/pm/state.json
 .agent/pm/logs/
 .agent/pm/context.md
+.agent/pm/prompt-*.tmp.md
 .agent/pm/wt/
 .env
