@@ -39,6 +39,15 @@ const CHECK = args.includes('--check');
 const FORCE = args.includes('--force');
 const ISSUE = (() => { const i = args.indexOf('--issue'); return i >= 0 ? args[i + 1] : null; })();
 
+
+/** 确保用到的标签存在（缺失会导致 gh issue edit 整体失败并丢标签） */
+const LABELS_NEEDED = [LABEL_SCREENED, LABEL_REJECTED, LABEL_APPROVED, LABEL_AUTO, LABEL_PROPOSAL];
+function ensureLabels() {
+  for (const l of LABELS_NEEDED) {
+    try { sh(['gh', 'label', 'create', l, '--force']); } catch { /* already exists */ }
+  }
+}
+
 function loadEnv() {
   const p = path.join(ROOT, '.env');
   if (!existsSync(p)) return;
@@ -203,13 +212,15 @@ function screenOne(issue, budgetLeft) {
   const body = head + (splitPlan ? `\n### 拆分建议\n${splitPlan}\n` : '') +
     `\n❌ ${verdict === 'SPLIT' ? '方向有价值但 scope 过大/缺前置条件 —— 已按策略关闭，拆分建议见上；如认可可重开更小的 issue。' : '判定不值得实现 —— 已关闭并记入 PM 记忆，避免重复提案。'}`;
   gh(['issue', 'comment', String(issue.number), '--body', body]);
-  try { gh(['issue', 'edit', String(issue.number), '--add-label', LABEL_SCREENED, '--add-label', LABEL_REJECTED]); } catch {}
+  try { gh(['issue', 'edit', String(issue.number), '--add-label', LABEL_SCREENED, '--add-label', LABEL_REJECTED]); }
+  catch (e) { log(`⚠️ 标签写入失败（会丢失 pm-screened/agent-rejected 标记）: ${String(e.message).slice(0, 160)}`); }
   try { gh(['issue', 'close', String(issue.number), '--reason', 'not planned']); } catch {}
   recordRejection(verdict, issue, why, splitPlan);
   return verdict;
 }
 
 function main() {
+  ensureLabels();
   const used = autoApprovedThisWeek();
   const budgetLeft = Math.max(0, CAP - used);
 

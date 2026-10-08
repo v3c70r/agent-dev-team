@@ -244,10 +244,10 @@ const CHECKS = [
       let names;
       try { names = new Set(JSON.parse(out).map(x => x.name)); }
       catch { return { status: 'fail', detail: '无法解析 label 列表', fix: '确认 gh label list 正常返回 JSON' }; }
-      const required = ['agent-seen', 'agent-approved', 'agent-rejected'];
+      const required = ['agent-seen', 'agent-approved', 'agent-rejected', 'pm-proposal', 'pm-screened', 'agent-auto-approved'];
       const missing = required.filter(n => !names.has(n));
       if (missing.length) return { status: 'fail', detail: `缺少远端 labels: ${missing.join(', ')}`, fix: `创建缺失标签，例如 \`gh label create ${missing[0]}\`` };
-      return { status: 'pass', detail: 'agent-seen / agent-approved / agent-rejected 均存在' };
+      return { status: 'pass', detail: `${required.length} 个必需标签均存在` };
     },
   },
 ];
