@@ -43,12 +43,18 @@ PM Agent（可选，定时折扣时段）──▶ 竞品调研 ──▶ 提案
 2. **PM Agent**：是否安装？若安装：每日运行时刻（UTC，建议落在所用模型的折扣时段，如
    DeepSeek 为 16:30–00:30 UTC）；每日/每周提案上限（默认 1/天、5/周）。
    PM 需要联网调研：是否安装 brave-search 技能（需 `BRAVE_API_KEY`）？
-3. **自我提升反馈（opt-in）**：明确询问——
+3. **提案筛选与自动实现**（若安装了 PM）：明确询问——
+   > PM 提出的 `pm-proposal` 要不要交给**独立筛选 agent**自动评估？
+   > - 通过 → **直接自动实现**（不再需要你 /approve）
+   > - 不值得 / 需拆分 → 自动评论理由并关闭，同时记入 `docs/product-review.md` 避免重复提案
+   > 每周自动实现上限（`screenAutoCapWeekly`，默认 5）用于防失控。
+   筛选模型建议用便宜档位（如 `deepseek-v4-flash`）。
+4. **自我提升反馈（opt-in）**：明确询问——
    > 是否开启 skill 自我提升反馈？使用中若流水线遇到模板本身的缺陷，
    > 会自动向 github.com/v3c70r/agent-dev-team 发 `[skill-feedback]` issue
    > （仅含错误描述与堆栈，**不含你的代码**；每日最多 3 条；随时可关）。
    记录用户选择，写入 `.agent/config.json`。
-4. **触发通知的账号**：`/approve` 提醒要 @ 谁（默认仓库 owner）。
+5. **触发通知的账号**：`/approve` 提醒要 @ 谁（默认仓库 owner）。
 
 ## 第三步：安装模板
 
@@ -62,9 +68,16 @@ PM Agent（可选，定时折扣时段）──▶ 竞品调研 ──▶ 提案
 | `.agent/prompts/implementer.md` | `templates/prompts/implementer.md` | 无需改 |
 | `.agent/prompts/reviewer.md` | `templates/prompts/reviewer.md` | 无需改 |
 | `.agent/supervisor.sh` | `templates/supervisor.sh` | 无需改 |
-| `.agent/config.json` | `templates/config.json` | 填 upstream + feedbackOptIn + 模型 |
-| `.agent/pm/`（可选） | `templates/pm/` | 无需改（env 可覆盖） |
+| `.agent/config.json` | `templates/config.json` | 填 upstream + feedbackOptIn + 模型（review / reviewFallback / screener）+ screenAutoApprove |
+| `.agent/pm/`（可选） | `templates/pm/` | 无需改（env 可覆盖；含 run.mjs 产出提案、**screen.mjs 筛选提案**） |
+| `.agent/lib.mjs` | `templates/lib.mjs` | 无需改（共享工具：sh / detectBase / resolvePi） |
 | `.agents/skills/brave-search/`（可选） | `templates/brave-search/` | 无需改（运行时读 BRAVE_API_KEY） |
+
+**GitHub 标签**（triage 与筛选依赖，缺失会导致打标签失败）：
+```bash
+for l in agent-seen agent-approved agent-rejected pm-proposal pm-screened agent-auto-approved skill-feedback; do gh label create "$l" --force; done
+gh issue create ... 不需要预建，但 label 必须存在
+```
 
 **npm scripts**（若缺失则添加）：
 ```json

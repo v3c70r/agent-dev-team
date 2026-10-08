@@ -13,6 +13,8 @@
 │                              └──▶ Agent C 构建+功能测试      │
 │                                        └──▶ 自动合并/部署    │
 │ PM Agent（可选，每日折扣时段）：竞品调研 → 提案 issue        │
+│ 筛选 Agent：值不值得做？scope 是否一个 PR 装得下？            │
+│   通过 → 自动批准并进入实现；拒绝/需拆分 → 关闭 + 记入记忆   │
 └────────────────────────────────────────────────────────────┘
 ```
 
@@ -70,6 +72,9 @@ pi 会按 [`SKILL.md`](SKILL.md) 的步骤：做 preflight 检查 → 询问你�
 | `TEST_SKIP` | — | `=1` 跳过功能测试（演示用） |
 | `TEST_ENV_FILE` | 仓库 `.env` | 测试所需密钥的 env 文件路径（supervisor 自动注入） |
 | `PM_DAILY_CAP` / `PM_WEEKLY_CAP` | 1 / 5 | PM 提案上限 |
+| `SCREEN_PROVIDER` / `SCREEN_MODEL` | `deepseek` / `deepseek-v4-flash` | 提案筛选模型 |
+| `SCREEN_AUTO_APPROVE` | 1（config `screenAutoApprove`） | 筛选通过即自动实现 |
+| `SCREEN_AUTO_CAP_WEEKLY` | 5（config `screenAutoCapWeekly`） | 每周自动实现上限（防失控） |
 | `PM_HOUR_UTC` + `PM_WINDOW_*` | 17:00 + 16:30–00:30 | PM 运行时刻与**折扣时段窗口** |
 | `PI_BIN` | 自动解析 | 显式指定 pi 可执行文件 |
 

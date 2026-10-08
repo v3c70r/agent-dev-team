@@ -9,6 +9,7 @@
 | Agent B | 同上 → `prompts/reviewer.md`；**独立模型/会话** | `gh pr diff` → PR 评论 → `RESULT: APPROVE/REQUEST_CHANGES` | 是 |
 | Agent C | 同上 → `runTester()` | 分离 worktree + 真实构建/测试 → 通过则合并 | 否 |
 | PM Agent | `.agent/pm/run.mjs` + `pm/prompt.md`；定时 | 竞品调研 → `docs/product-review.md` + `pm-proposal` issue | 是 |
+| **筛选 Agent** | `.agent/pm/screen.mjs` + `pm/screener.md`；定时 | 独立评估提案价值与 scope（结合 A/B/C 能力边界）→ 通过则自动批准，否则关闭并记入产品记忆 | 是 |
 | Supervisor | `.agent/supervisor.sh`, `.agent/pm/supervisor.sh` | tmux 常驻、崩溃自愈、注入 env | 否 |
 
 ## 为什么这样分工

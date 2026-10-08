@@ -37,6 +37,7 @@ const REQUIRED = [
   'templates/issue-agent.yml', 'templates/pipeline.mjs', 'templates/lib.mjs', 'templates/supervisor.sh',
   'templates/prompts/implementer.md', 'templates/prompts/reviewer.md',
   'templates/pm/run.mjs', 'templates/pm/prompt.md', 'templates/pm/supervisor.sh',
+  'templates/pm/screener.md', 'templates/pm/screen.mjs',
   'templates/config.json', 'templates/gitignore.snippet',
   'docs/lessons.md', 'docs/architecture.md', 'docs/feedback.md', 'README.md', 'LICENSE',
 ];
@@ -59,6 +60,8 @@ const PAIRS = [
   ['templates/pm/run.mjs', '.agent/pm/run.mjs'],
   ['templates/pm/prompt.md', '.agent/pm/prompt.md'],
   ['templates/pm/supervisor.sh', '.agent/pm/supervisor.sh'],
+  ['templates/pm/screener.md', '.agent/pm/screener.md'],
+  ['templates/pm/screen.mjs', '.agent/pm/screen.mjs'],
 ];
 for (const [t, live] of PAIRS) {
   const lp = path.join(ROOT, live);

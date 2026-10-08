@@ -17,6 +17,8 @@ const PAIRS = [
   ['templates/pm/run.mjs', '.agent/pm/run.mjs'],
   ['templates/pm/prompt.md', '.agent/pm/prompt.md'],
   ['templates/pm/supervisor.sh', '.agent/pm/supervisor.sh'],
+  ['templates/pm/screener.md', '.agent/pm/screener.md'],
+  ['templates/pm/screen.mjs', '.agent/pm/screen.mjs'],
 ];
 
 let n = 0;

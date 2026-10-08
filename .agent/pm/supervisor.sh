@@ -12,6 +12,7 @@ LOG=.agent/pm/supervisor.log
 echo "[pm-supervisor $(date '+%F %T')] up — daily ${PM_HOUR_UTC:-17}:00 UTC (off-peak window ${PM_WINDOW_START_UTC:-16.5}–${PM_WINDOW_END_UTC:-24.5}), cap=${PM_DAILY_CAP:-1}/day, ${PM_WEEKLY_CAP:-5}/week" | tee -a "$LOG"
 
 while true; do
-  node .agent/pm/run.mjs 2>&1 | tee -a "$LOG"
-  sleep 900   # 15 min — cheap when idle (local date math, no network until due)
+  node .agent/pm/run.mjs 2>&1 | tee -a "$LOG"       # 产出提案（每日，折扣时段）
+  node .agent/pm/screen.mjs 2>&1 | tee -a "$LOG"    # 筛选待处理提案（发现即筛）
+  sleep 900   # 15 min — cheap when idle (local checks only until there is work)
 done
