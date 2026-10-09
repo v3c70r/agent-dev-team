@@ -21,12 +21,17 @@
 //    MAX_REVIEW_ROUNDS (default 3)  MAX_TEST_FIXES (default 2)
 //    TEST_SKIP=1                    skip functional tests (demo mode)
 //    TEST_ENV_FILE=/abs/path/.env   env file to copy into test worktree
+//    AGENT_BUILD_CMD / AGENT_TEST_CMD  Agent C's build/test commands
+//                                   (default `npm run build` / `npm test`;
+//                                    empty string = skip that step; non-npm
+//                                    repos MUST set them, e.g. `make build`,
+//                                    `pytest -q`)
 // ══════════════════════════════════════════════════════════════════
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, copyFileSync, symlinkSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { detectBase, resolvePi, sh } from './lib.mjs';
+import { detectBase, resolvePi, resolveTesterCommands, sh } from './lib.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const AGENT = path.join(ROOT, '.agent');
@@ -201,8 +206,20 @@ async function runReviewRound(issueNum, prNum) {
 }
 
 // ── Role C: tester (functional tests) ──
+
+/** Human-readable report of which commands Agent C will actually run. */
+function describeTesterCommands(cmds) {
+  const line = (label, v, key) => (v ? `- ${label}: \`${v}\`` : `- ${label}: 已跳过（\`${key}\` 为空）`);
+  return [line('build', cmds.build, 'AGENT_BUILD_CMD'), line('test', cmds.test, 'AGENT_TEST_CMD')].join('\n');
+}
+
 function runTester(issueNum, prNum, branch) {
   log(issueNum, `C: 开始功能测试 on ${branch}`);
+  // Commands are shell strings (so `pytest -q` / `make build` work) and are
+  // reported verbatim in the PR comment — the claim must equal what ran (lesson #17).
+  const cmds = resolveTesterCommands();
+  const ran = describeTesterCommands(cmds);
+  const nothingToRun = !cmds.build && !cmds.test;
   const wt = path.join(TMP, `wt-${issueNum}`);
   rmSync(wt, { recursive: true, force: true });
   mkdirSync(TMP, { recursive: true });
@@ -226,15 +243,16 @@ function runTester(issueNum, prNum, branch) {
       symlinkSync(rootModules, path.join(wt, 'node_modules'), 'dir');
     }
     if (process.env.TEST_ENV_FILE && existsSync(process.env.TEST_ENV_FILE)) copyFileSync(process.env.TEST_ENV_FILE, path.join(wt, '.env'));
-    sh(['npm', 'run', 'build'], { cwd: wt });
-    const report = sh(['npm', 'test'], { cwd: wt }).split('\n').slice(-60).join('\n');
-    log(issueNum, `C: 测试通过 ✅\n${report}`);
-    commentOnPr(prNum, `🤖 **Agent C 功能测试通过** ✅（构建 + 测试套件通过）`);
+    if (cmds.build) sh(['bash', '-lc', cmds.build], { cwd: wt });
+    const testOut = cmds.test ? sh(['bash', '-lc', cmds.test], { cwd: wt }) : '';
+    const report = testOut.split('\n').slice(-60).join('\n');
+    log(issueNum, `C: 测试通过 ✅（${ran}）\n${report}`);
+    commentOnPr(prNum, `🤖 **Agent C 功能测试通过** ✅${nothingToRun ? '（未配置构建/测试命令，已跳过执行）' : '（构建 + 测试套件通过）'}\n\n实际执行：\n${ran}`);
     return { pass: true };
   } catch (e) {
     const report = (e.stdout || e.message || '').split('\n').slice(-60).join('\n');
     log(issueNum, `C: 测试失败 ❌\n${report}`);
-    commentOnPr(prNum, `🤖 **Agent C 功能测试失败** ❌\n\`\`\`\n${report.slice(0, 3000)}\n\`\`\``);
+    commentOnPr(prNum, `🤖 **Agent C 功能测试失败** ❌\n\n实际执行：\n${ran}\n\n\`\`\`\n${report.slice(0, 3000)}\n\`\`\``);
     return { pass: false };
   } finally {
     if (added) { try { sh(['git', 'worktree', 'remove', wt, '--force']); } catch {} }

@@ -22,6 +22,18 @@ export function sh(cmd, opts = {}) {
   return out.trim();
 }
 
+// Agent C's build/test commands. Defaults keep the historical npm behaviour,
+// but repos that are NOT npm-based (Python/Go/Rust) or that simply have no
+// build/test scripts must be able to install this skill — they set
+// AGENT_BUILD_CMD / AGENT_TEST_CMD (e.g. `make build` / `pytest -q`).
+// An explicit empty string means "skip that step". The resolved values are what
+// the PR comment reports, so the claim always equals what actually ran (lesson #17).
+export function resolveTesterCommands(env = process.env) {
+  const build = env.AGENT_BUILD_CMD ?? 'npm run build';
+  const test = env.AGENT_TEST_CMD ?? 'npm test';
+  return { build: String(build).trim(), test: String(test).trim() };
+}
+
 // default branch auto-detected (main/master); override with AGENT_BASE.
 // NOTE: `refs/remotes/origin/HEAD` is often MISSING on fresh clones (e.g. after
 // `gh repo create --source=. --push`), so never let detection throw at import time.

@@ -72,6 +72,8 @@ pi 会按 [`SKILL.md`](SKILL.md) 的步骤：做 preflight 检查 → 询问你�
 | `MAX_TEST_FIXES` | 2 | 测试失败后的修复轮数上限 |
 | `TEST_SKIP` | — | `=1` 跳过功能测试（演示用） |
 | `TEST_ENV_FILE` | 仓库 `.env` | 测试所需密钥的 env 文件路径（supervisor 自动注入） |
+| `AGENT_BUILD_CMD` | `npm run build` | Agent C 的构建命令（shell 字符串，如 `make build`；空串=跳过该步骤） |
+| `AGENT_TEST_CMD` | `npm test` | Agent C 的测试命令（如 `pytest -q`；空串=跳过；**非 npm 仓库必须设置**） |
 | `PM_DAILY_CAP` / `PM_WEEKLY_CAP` | 1 / 5 | PM 提案上限 |
 | `SCREEN_PROVIDER` / `SCREEN_MODEL` | `deepseek` / `deepseek-v4-flash` | 提案筛选模型 |
 | `SCREEN_AUTO_APPROVE` | 1（config `screenAutoApprove`） | 筛选通过即自动实现 |

@@ -7,7 +7,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { detectBase, resolvePi, sh } from '../templates/lib.mjs';
+import { detectBase, resolvePi, resolveTesterCommands, sh } from '../templates/lib.mjs';
 
 const ROOT = process.cwd();
 const run = (cmd, opts = {}) => sh(cmd, { cwd: ROOT, ...opts });
@@ -187,13 +187,23 @@ const CHECKS = [
   {
     name: 'build/test',
     run() {
+      // Explicit configuration wins: `AGENT_BUILD_CMD`/`AGENT_TEST_CMD` let
+      // non-npm repos (Python/Go/Rust) and Node repos without build/test scripts
+      // install the loop. Empty string = skip that step.
+      const configured = process.env.AGENT_BUILD_CMD !== undefined || process.env.AGENT_TEST_CMD !== undefined;
+      const cmds = resolveTesterCommands();
+      if (configured) {
+        const show = (label, v, key) => (v ? `${label}=\`${v}\`` : `${label}=跳过（\`${key}\` 为空）`);
+        return { status: 'pass', detail: `使用环境变量：${show('build', cmds.build, 'AGENT_BUILD_CMD')}；${show('test', cmds.test, 'AGENT_TEST_CMD')}` };
+      }
+      const envFix = '或设置 AGENT_BUILD_CMD / AGENT_TEST_CMD（如 `make build` / `pytest -q`；空串=跳过该步骤）';
       const p = path.join(ROOT, 'package.json');
-      if (!existsSync(p)) return { status: 'fail', detail: 'package.json 不存在', fix: '创建 package.json 并定义 build/test scripts' };
+      if (!existsSync(p)) return { status: 'fail', detail: 'package.json 不存在', fix: `创建 package.json 并定义 build/test scripts，${envFix}` };
       let pkg;
       try { pkg = JSON.parse(readFileSync(p, 'utf8')); } catch { return { status: 'fail', detail: 'package.json 无法解析', fix: '修复 package.json 的 JSON 语法' }; }
       const missing = ['build', 'test'].filter(k => !(pkg.scripts || {})[k]);
-      if (missing.length) return { status: 'fail', detail: `缺少 scripts: ${missing.join(', ')}`, fix: '在 package.json scripts 中添加 build 与 test（Agent C 依赖）' };
-      return { status: 'pass', detail: 'build + test 均存在' };
+      if (missing.length) return { status: 'fail', detail: `缺少 scripts: ${missing.join(', ')}`, fix: `在 package.json scripts 中添加 build 与 test（Agent C 依赖），${envFix}` };
+      return { status: 'pass', detail: `默认 npm 语义：build=\`${cmds.build}\`；test=\`${cmds.test}\`` };
     },
   },
   {

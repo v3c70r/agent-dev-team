@@ -36,9 +36,14 @@ CI / 脚本需要机器可读结果时，加 `--json`（等价 `npm run doctor:j
 `node scripts/doctor.mjs --json`）。
 
 同时确认（决定 Agent C 如何工作）：
-- 仓库的构建/测试命令（doctor 会检查 `package.json` scripts 的 `build` / `test`）
+- 仓库的构建/测试命令：默认为 `npm run build` / `npm test`（doctor 在 `package.json` 有对应
+  scripts 时通过）。**npm 仓库，或显式配置 `AGENT_BUILD_CMD` / `AGENT_TEST_CMD`（非 npm 仓库必需）**
+  —— Python/Go/Rust 仓库（如 `make build` / `pytest -q`）以及没有 `build`/`test` scripts 的 Node
+  仓库，必须设置这两个变量，否则 preflight 会失败；设为空串表示跳过该步骤。doctor 的 `build/test`
+  一项会显示 Agent C 实际将执行的命令
 - 若测试需要密钥（如地图 token）：存在哪个 env 文件？测试用 `TEST_ENV_FILE` 注入
-- 若仓库没有任何测试：警告用户"Agent C 将只跑 build"，建议先补测试
+- 若仓库没有任何测试：警告用户"Agent C 将只跑 build"（或 `AGENT_TEST_CMD=''` 显式跳过测试），
+  建议先补测试
 
 **任何一个 preflight 失败都不要继续安装**，向用户报告缺什么。
 
