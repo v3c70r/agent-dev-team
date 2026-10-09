@@ -3,9 +3,11 @@
 // Checks: syntax of all mjs/sh, SKILL.md frontmatter, template completeness,
 // doctor self-check, and that the live .agent/ copies match templates/ (no drift).
 import { execFileSync } from 'node:child_process';
-import { readFileSync, existsSync, readdirSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync, mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import * as lib from '../templates/lib.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 let failures = 0;
@@ -145,6 +147,58 @@ let doctorHumanOut = '';
   const markers = ['🔍 agent-dev-team doctor', '结果：', '─'.repeat(80)];
   const missing = markers.filter(m => !doctorHumanOut.includes(m));
   missing.length ? fail(`doctor 人类表格输出回归（缺: ${missing.join(' / ')}）`) : ok('doctor 人类表格输出未回归');
+}
+
+// 12. Agent C 的构建/测试命令必须可配置（lesson #17 的收尾）
+//   非 npm 仓库、或没有 build/test scripts 的 Node 仓库，此前在 preflight 就被拦下。
+{
+  const cases = [
+    ['defaults', {}, { build: 'npm run build', test: 'npm test' }],
+    ['custom', { AGENT_BUILD_CMD: 'make build', AGENT_TEST_CMD: 'pytest -q' }, { build: 'make build', test: 'pytest -q' }],
+    ['empty test = skip', { AGENT_TEST_CMD: '' }, { build: 'npm run build', test: '' }],
+    ['trim', { AGENT_BUILD_CMD: '  make build  ' }, { build: 'make build' }],
+  ];
+  if (typeof lib.resolveTesterCommands !== 'function') fail('templates/lib.mjs 缺少 resolveTesterCommands()');
+  else for (const [label, env, expect] of cases) {
+    let got;
+    try { got = lib.resolveTesterCommands(env); }
+    catch (e) { fail(`resolveTesterCommands(${label}) 抛错: ${e.message}`); continue; }
+    const bad = Object.entries(expect).filter(([k, v]) => got?.[k] !== v);
+    if (bad.length) fail(`resolveTesterCommands(${label}): ${bad.map(([k, v]) => `${k} 期望 ${JSON.stringify(v)} 实得 ${JSON.stringify(got?.[k])}`).join('; ')}`);
+    else ok(`resolveTesterCommands(${label})`);
+  }
+  // pipeline 不得再硬编码 npm 命令（实际执行必须等于可配置值 · lesson #17）
+  const pipeSrc = readFileSync(path.join(ROOT, 'templates/pipeline.mjs'), 'utf8');
+  const hard = [
+    ["['npm', 'run', 'build']", /\[['"]npm['"],\s*['"]run['"],\s*['"]build['"]\]/],
+    ["['npm', 'test']", /\[['"]npm['"],\s*['"]test['"]\]/],
+  ].filter(([, re]) => re.test(pipeSrc));
+  hard.length ? fail(`templates/pipeline.mjs 仍硬编码 npm 命令: ${hard.map(h => h[0]).join(', ')}`) : ok('pipeline tester commands not hardcoded');
+  /resolveTesterCommands/.test(pipeSrc) ? ok('pipeline uses resolveTesterCommands') : fail('templates/pipeline.mjs 未使用 resolveTesterCommands');
+  // the PR comment must report what actually ran (both pass and fail paths)
+  const ranUses = (pipeSrc.match(/\$\{ran\}/g) || []).length;
+  if (pipeSrc.includes('实际执行') && ranUses >= 2) ok('tester comment reports the commands actually run');
+  else fail(`templates/pipeline.mjs 的测试评论未写明实际执行的命令（实际执行 标记=${pipeSrc.includes('实际执行')}，\${ran} 出现 ${ranUses} 次）`);
+  // doctor 在配置了 env 的目录下必须放行（即便没有 package.json）
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'agent-doctor-'));
+  try {
+    let out = '';
+    try {
+      out = execFileSync('node', [path.join(ROOT, 'scripts/doctor.mjs'), '--json'], {
+        cwd: tmp,
+        encoding: 'utf8',
+        stdio: 'pipe',
+        env: { ...process.env, AGENT_BUILD_CMD: 'make build', AGENT_TEST_CMD: 'pytest -q' },
+      });
+    } catch (e) { out = String(e.stdout || ''); }
+    let data = null;
+    try { data = JSON.parse(out); } catch { /* asserted below */ }
+    const bt = data?.checks?.find(c => c.name === 'build/test');
+    if (!bt) fail('doctor --json 缺少 build/test 检查（无法断言 env 配置路径）');
+    else if (bt.status !== 'pass') fail(`doctor 配置 AGENT_BUILD_CMD/AGENT_TEST_CMD 后 build/test 应为 pass，实为 ${bt.status}: ${bt.detail}`);
+    else if (!bt.detail.includes('make build') || !bt.detail.includes('pytest -q')) fail(`doctor build/test detail 未显示实际命令: ${bt.detail}`);
+    else ok('doctor honours AGENT_BUILD_CMD/AGENT_TEST_CMD (no package.json)');
+  } finally { rmSync(tmp, { recursive: true, force: true }); }
 }
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} FAILURE(S)`);
