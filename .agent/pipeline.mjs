@@ -31,7 +31,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, copyFileSync, symlinkSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { detectBase, resolvePi, resolveTesterCommands, sh } from './lib.mjs';
+import { detectBase, mergeIssueState, prepareImplementerBranch, resolvePi, resolveTesterCommands, sh } from './lib.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const AGENT = path.join(ROOT, '.agent');
@@ -112,15 +112,11 @@ async function runImplementer(issue, roundNote = '') {
   const s = state.load();
   const branch = `agent/${issue.number}`;
   const prompt = buildPrompt('implementer', { issue, branch, roundNote });
-  log(issue.number, `A: 开始实现 (branch=${branch}, model=${describeModel(IMPL)}) ${roundNote ? '——' + roundNote : ''}`);
-  try {
-    sh(['git', 'fetch', 'origin', BASE]);
-    sh(['git', 'checkout', '-B', branch, `origin/${BASE}`]);
-  } catch {
-    // branch exists upstream; reset local tracking copy
-    sh(['git', 'checkout', branch]);
-    sh(['git', 'reset', '--hard', `origin/${branch}`]);
-  }
+  // Fix rounds MUST continue on the PR's existing branch; only the first round
+  // branches off base. `git checkout -B` on an existing branch would reset it
+  // back to base (lesson #18), so branch prep lives in a tested helper.
+  const { reused } = prepareImplementerBranch({ branch, base: BASE });
+  log(issue.number, `A: 开始实现 (branch=${branch}, ${reused ? `修复轮：基于 PR 现有分支 origin/${branch}` : `首轮：基于 origin/${BASE}`}, model=${describeModel(IMPL)}) ${roundNote ? '——' + roundNote : ''}`);
   const out = runPi(`agent-issue-${issue.number}`, prompt, branch, IMPL);
   log(issue.number, `A: pi 输出（尾）:\n${out.split('\n').slice(-40).join('\n')}`);
 
@@ -145,9 +141,10 @@ async function runImplementer(issue, roundNote = '') {
   }
   if (pr) {
     commentOnPr(pr.number, `🤖 **Agent A 完成实现**（${describeModel(IMPL)}），等待 Agent B review（${describeModel(REVIEW)}）。`);
-    s[issue.number] = { status: 'pr_open', pr: pr.number, branch, round: 0, fixes: 0, title: issue.title };
+    // merge, never replace — `round`/`fixes` recorded by earlier rounds must survive
+    s[issue.number] = mergeIssueState(s[issue.number], { status: 'pr_open', pr: pr.number, branch, title: issue.title });
   } else {
-    s[issue.number] = { status: 'pr_open', pr: null, branch, round: 0, fixes: 0, title: issue.title };
+    s[issue.number] = mergeIssueState(s[issue.number], { status: 'pr_open', pr: null, branch, title: issue.title });
     log(issue.number, 'PR 尚未可查，稍后按分支重查');
   }
   state.save(s);
@@ -414,6 +411,10 @@ async function processIssueInner(issue, force = false) {
       return { skipped: 'failed' };
     }
     const note = `Agent C 功能测试失败。请修复后重新推送。失败信息见 PR #${s2[issue.number].pr || pr.number} 评论。`;
+    // `round` counts review rounds, `fixes` counts test-driven fix rounds.
+    // Save BEFORE runImplementer so its merge (mergeIssueState) reads the new value.
+    s2[issue.number].fixes = (s2[issue.number].fixes || 0) + 1;
+    state.save(s2);
     await runImplementer(issue, note);
   }
 }

@@ -3,7 +3,7 @@
 // Checks: syntax of all mjs/sh, SKILL.md frontmatter, template completeness,
 // doctor self-check, and that the live .agent/ copies match templates/ (no drift).
 import { execFileSync } from 'node:child_process';
-import { readFileSync, existsSync, readdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, readdirSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -198,6 +198,69 @@ let doctorHumanOut = '';
     else if (bt.status !== 'pass') fail(`doctor 配置 AGENT_BUILD_CMD/AGENT_TEST_CMD 后 build/test 应为 pass，实为 ${bt.status}: ${bt.detail}`);
     else if (!bt.detail.includes('make build') || !bt.detail.includes('pytest -q')) fail(`doctor build/test detail 未显示实际命令: ${bt.detail}`);
     else ok('doctor honours AGENT_BUILD_CMD/AGENT_TEST_CMD (no package.json)');
+  } finally { rmSync(tmp, { recursive: true, force: true }); }
+}
+
+// 13. Agent A 的修复轮必须基于 PR 现有分支（lesson #18）
+//     `git checkout -B <branch> origin/<base>` 会把已存在的分支静默重置回 base，
+//     丢掉上一轮实现并让 push 被非快进拒绝。用临时 bare origin + clone 做真集成断言
+//     （无网络、无 gh、无 pi 依赖）。
+{
+  const g = (cwd, ...args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: 'pipe' }).trim();
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'agent-branch-'));
+  try {
+    if (typeof lib.prepareImplementerBranch !== 'function') throw new Error('templates/lib.mjs 缺少 prepareImplementerBranch()');
+    if (typeof lib.mergeIssueState !== 'function') throw new Error('templates/lib.mjs 缺少 mergeIssueState()');
+    const origin = path.join(tmp, 'origin.git');
+    const work = path.join(tmp, 'work');
+    g(tmp, 'init', '--bare', origin);
+    g(tmp, 'init', '-b', 'master', work);
+    // commit identity must be explicit — CI runners often have no global git config
+    g(work, 'config', 'user.email', 'agent@test.local');
+    g(work, 'config', 'user.name', 'Agent Test');
+    writeFileSync(path.join(work, 'base.txt'), 'base\n');
+    g(work, 'add', '-A');
+    g(work, 'commit', '-m', 'base');
+    g(work, 'remote', 'add', 'origin', origin);
+    g(work, 'push', '-u', 'origin', 'master');
+
+    const branch = 'agent/13';
+    // first round — branch off origin/<base>
+    const first = lib.prepareImplementerBranch({ branch, base: 'master', cwd: work });
+    if (first?.reused !== false) throw new Error(`首轮 reused 应为 false，实为 ${JSON.stringify(first)}`);
+    const baseSha = g(work, 'rev-parse', 'origin/master');
+    if (g(work, 'rev-parse', 'HEAD') !== baseSha) throw new Error(`首轮 HEAD != origin/master（${baseSha}）`);
+
+    // simulate Agent A's implementation round on the PR branch
+    writeFileSync(path.join(work, 'impl.txt'), 'round 1\n');
+    g(work, 'add', '-A');
+    g(work, 'commit', '-m', 'impl round 1');
+    const implSha = g(work, 'rev-parse', 'HEAD');
+    g(work, 'push', '-u', 'origin', branch);
+
+    // fix round — MUST reuse the PR branch, not reset back to base
+    const second = lib.prepareImplementerBranch({ branch, base: 'master', cwd: work });
+    if (second?.reused !== true) throw new Error(`修复轮 reused 应为 true，实为 ${JSON.stringify(second)}`);
+    const remoteSha = g(work, 'rev-parse', `origin/${branch}`);
+    if (g(work, 'rev-parse', 'HEAD') !== remoteSha) throw new Error(`修复轮 HEAD != origin/${branch}（${remoteSha}）`);
+    if (remoteSha === baseSha) throw new Error('修复轮分支 == base（丢掉上一轮实现）');
+    let ancestor = true;
+    try { g(work, 'merge-base', '--is-ancestor', implSha, 'HEAD'); } catch { ancestor = false; }
+    if (!ancestor) throw new Error('修复轮 HEAD 不含上一轮 commit（impl commit 不是 HEAD 的祖先）');
+
+    // state merge must keep counters written by earlier rounds
+    const merged = lib.mergeIssueState({ round: 1, status: 'reviewing' }, { status: 'pr_open', pr: 42 });
+    if (merged.round !== 1) throw new Error(`mergeIssueState 丢失 round:1 → ${JSON.stringify(merged)}`);
+    if (merged.status !== 'pr_open' || merged.pr !== 42) throw new Error(`mergeIssueState patch 未生效 → ${JSON.stringify(merged)}`);
+
+    // pipeline must route branch prep through the helper, never a bare checkout -B
+    const pipe = readFileSync(path.join(ROOT, 'templates/pipeline.mjs'), 'utf8');
+    if (!/prepareImplementerBranch\(/.test(pipe)) throw new Error('templates/pipeline.mjs 未调用 prepareImplementerBranch()');
+    if (/git',\s*'checkout',\s*'-B'/.test(pipe)) throw new Error("templates/pipeline.mjs 仍有裸 git checkout -B");
+
+    ok('prepareImplementerBranch: fix round reuses PR branch (no reset to base); mergeIssueState keeps counters');
+  } catch (e) {
+    fail(`修复轮分支准备/状态合并: ${e.message}`);
   } finally { rmSync(tmp, { recursive: true, force: true }); }
 }
 
