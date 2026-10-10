@@ -34,6 +34,39 @@ export function resolveTesterCommands(env = process.env) {
   return { build: String(build).trim(), test: String(test).trim() };
 }
 
+// Prepare the branch Agent A implements on.
+// FIRST round: branch off `origin/<base>`. FIX round: the PR branch already
+// exists upstream, so we MUST continue on it — `git checkout -B <branch>
+// origin/<base>` would silently RESET it back to base (dropping the previous
+// round's commits) and turn the follow-up `git push` into a non-fast-forward
+// reject. This is the single, testable place where that decision is made
+// (lesson #18). `fetch origin` (all refs) is required so `origin/<branch>`
+// is up to date on the fix-round path.
+export function prepareImplementerBranch({ branch, base, cwd } = {}) {
+  const exists = (ref) => {
+    try { sh(['git', 'rev-parse', '--verify', '--quiet', ref], { cwd }); return true; }
+    catch { return false; }
+  };
+  sh(['git', 'fetch', 'origin', '--quiet'], { cwd });
+  const remote = `origin/${branch}`;
+  if (exists(remote)) {
+    // fix round — continue on the PR branch (`checkout <branch>` auto-creates a
+    // local tracking branch when this checkout does not have one yet).
+    sh(['git', 'checkout', branch], { cwd });
+    sh(['git', 'reset', '--hard', remote], { cwd });
+    return { reused: true };
+  }
+  sh(['git', 'checkout', '-B', branch, `origin/${base}`], { cwd });
+  return { reused: false };
+}
+
+// State updates must MERGE, never replace: overwriting an issue entry with a
+// fresh `{round:0,fixes:0}` erased the review round the loop had just recorded,
+// so state.json could not remember that any fix round happened (lesson #18).
+export function mergeIssueState(prev, patch) {
+  return { ...(prev || {}), ...patch };
+}
+
 // default branch auto-detected (main/master); override with AGENT_BASE.
 // NOTE: `refs/remotes/origin/HEAD` is often MISSING on fresh clones (e.g. after
 // `gh repo create --source=. --push`), so never let detection throw at import time.

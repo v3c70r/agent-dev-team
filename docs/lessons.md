@@ -276,3 +276,41 @@ PM 下次既不知道"该怎么小范围重提"，也分不清"不许再提"与"
 
 **教训**：跨 agent 共享的"记忆"必须满足三条 —— **单一所有者、结构化（可机读）、被动注入**
 （而不是期待对方主动去读）。把审计写进对方会重写的文件里，等于没写。
+
+---
+
+## 18. 修复轮把分支重置回 base，且状态计数器被覆盖
+
+**现象**：Agent A 的**修复轮**（Agent B `REQUEST_CHANGES` 之后、Agent C 测试失败之后）
+会把 agent 分支重置回 base，而不是基于 PR 现有分支继续提交。临时仓库实测：
+`git checkout -B <branch> origin/<base>` 之后工作区回到 base，随后 `git push` 因
+**非快进被拒**；`.agent/state.json` 中 #7 记 `round:0`，而 `.agent/logs/issue-7.md`
+明确记录发生过一轮修复 —— 状态机根本无法记录修复轮次。
+
+**根因**：
+1. `runImplementer()` 每轮都无条件执行 `git fetch` + `git checkout -B <branch> origin/<base>`。
+   `checkout -B` 对**已存在**的分支会静默强制重置到 base（不抛异常），因此唯一正确处理
+   "修复轮"的 `catch`（`checkout <branch>` + `reset --hard origin/<branch>`）是**死代码**。
+   结果：编排层把分支处理**外包给了实现模型**（只能靠 LLM 在会话里自己跟远端对账），
+   多一次非确定步骤 + 额外 token，失败则落入 `needs_human`。
+2. 同一函数的同一根因：审查循环刚写入 `round = r+1`，紧接着 `runImplementer()` 用
+   `{ round:0, fixes:0 }` **整条覆盖**该条目；`fixes` 全仓没有任何递增点。
+
+**修复**：
+- 新增可测试的 `lib.prepareImplementerBranch({ branch, base, cwd })` —— `origin/<branch>`
+  存在则 `checkout <branch>` + `reset --hard origin/<branch>`（**基于 PR 现有分支**），
+  否则才从 `origin/<base>` 新开分支；`runImplementer()` 改调该 helper 并把
+  `首轮/修复轮` 写进日志。
+- 状态写入改为 `lib.mergeIssueState(prev, patch)`（**合并**，不覆盖），`round` 由审查轮维护、
+  `fixes` 由测试修复轮递增（在调用 `runImplementer` **之前** `state.save`，否则被读到旧值）。
+- `scripts/validate.mjs` 新增 check 13：在临时 bare origin + clone 中做真集成断言 ——
+  首轮 `reused===false` 且 HEAD===`origin/<base>`；提交并推送后再调用 → `reused===true`、
+  HEAD===`origin/<branch>`、且上一轮 commit 仍是 HEAD 的祖先（反向断言"未回到 base"）；
+  另断言 `mergeIssueState` 保留 `round:1`。
+
+**教训**：
+- 自动化的"修复轮"**必须**基于 PR 现有分支；harness **绝不能**把 agent 放在 base 上提交
+  （非快进 push = 静默搁置工作，最终以 `needs_human` 收场）。
+- 任何"检查存在性再分支"的逻辑都要有**真仓库集成测试**：`try/catch` 兜底路径不会被
+  "命令不抛异常"这一事实触发，成为永远不被执行的死代码。
+- 状态机必须能**记录**它声称在度量的事（修复轮次）；整条覆盖写入等于把度量归零。

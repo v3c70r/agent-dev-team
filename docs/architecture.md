@@ -44,6 +44,12 @@
 持久化在 `.agent/state.json`（本地，gitignored）。终态：
 `merged` / `failed` / `needs_human` / `rejected`。
 
+修复轮（review `REQUEST_CHANGES` 或 C 测试失败）由 `lib.prepareImplementerBranch()` 准备分支：
+`origin/<branch>` 已存在则 `checkout <branch>` + `reset --hard origin/<branch>`（**基于 PR 现有分支**
+继续提交），否则才从 `origin/<base>` 新开分支 —— harness 绝不在 base 上提交修复。
+`state.json` 的 `round`（审查轮）与 `fixes`（测试修复轮）经 `lib.mergeIssueState()` **合并**写入，
+不会被实现轮覆盖（lesson #18）。
+
 ## 共享记忆
 
 | 介质 | 内容 | 谁能读 |
