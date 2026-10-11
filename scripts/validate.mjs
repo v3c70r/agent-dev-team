@@ -264,5 +264,74 @@ let doctorHumanOut = '';
   } finally { rmSync(tmp, { recursive: true, force: true }); }
 }
 
+// 14. /reject 必须真正取消批准（issue #14）
+//     只加否定标签 ≠ 取消：标签驱动的取活逻辑必须把 agent-rejected 当硬排除，
+//     且 workflow 的 approve/reject 两个标签互斥（否则"已取消但仍在跑/被自动合并"）。
+{
+  // 14a. 纯函数 selectPendingIssues：否决优先 + 终态排除
+  if (typeof lib.selectPendingIssues !== 'function') {
+    fail('templates/lib.mjs 缺少 selectPendingIssues()');
+  } else {
+    const cases = [
+      ['双标签·字符串 labels 被否决优先排除', [{ number: 1, labels: ['agent-approved', 'agent-rejected'] }], {}, []],
+      ['双标签·对象 labels 被否决优先排除', [{ number: 1, labels: [{ name: 'agent-approved' }, { name: 'agent-rejected' }] }], {}, []],
+      ['state=needs_human 排除', [{ number: 2, labels: ['agent-approved'] }], { 2: { status: 'needs_human' } }, []],
+      ['state=merged 排除', [{ number: 3, labels: ['agent-approved'] }], { 3: { status: 'merged' } }, []],
+      ['state=failed 排除', [{ number: 4, labels: ['agent-approved'] }], { 4: { status: 'failed' } }, []],
+      ['state=rejected 排除', [{ number: 5, labels: ['agent-approved'] }], { 5: { status: 'rejected' } }, []],
+      ['全新/进行中的 issue 仍被包含（回归：行为零变化）',
+        [{ number: 6, labels: ['agent-approved'] }, { number: 7, labels: ['agent-approved'] }], { 7: { status: 'pr_open' } }, [6, 7]],
+    ];
+    const problems = [];
+    for (const [label, issues, st, expect] of cases) {
+      let got;
+      try { got = lib.selectPendingIssues(issues, st).map(i => i.number); }
+      catch (e) { problems.push(`${label} 抛错: ${e.message}`); continue; }
+      if (JSON.stringify(got) !== JSON.stringify(expect)) problems.push(`${label}: 期望 [${expect}] 实得 [${got}]`);
+    }
+    problems.length ? fail(`selectPendingIssues: ${problems.join('; ')}`) : ok('selectPendingIssues: 否决优先 + 终态排除 + 未批准不回归');
+  }
+
+  // 14b. pipeline 走 helper，且把 /reject 落成 rejected 终态
+  const pipe = readFileSync(path.join(ROOT, 'templates/pipeline.mjs'), 'utf8');
+  if (/selectPendingIssues\(/.test(pipe)) ok('pipeline watch 使用 selectPendingIssues()');
+  else fail('templates/pipeline.mjs 未用 selectPendingIssues() 判定待处理 issue');
+  if (/\[\s*'merged',\s*'failed',\s*'needs_human',\s*'rejected'\s*\]/.test(pipe)) fail('templates/pipeline.mjs 仍内联写死 pending 终态数组');
+  else ok('pipeline 未内联 pending 终态数组');
+  if (/isRejectedIssue\(/.test(pipe) && /status[^;]*'rejected'/.test(pipe)) ok('pipeline 把 agent-rejected 的 issue 置为 rejected 终态');
+  else fail("templates/pipeline.mjs 未在 processIssue() 开头把 agent-rejected 的 issue 置为 rejected 终态");
+  if (/'rejected'/.test(pipe) && /issue',\s*'view'[\s\S]{0,120}labels/.test(pipe)) ok('pipeline 手动 run 路径带上 labels（否决可见）');
+  else fail('templates/pipeline.mjs 手动 run 路径未取 labels（无法识别 /reject）');
+
+  // 14b-2. 合并不可逆：finishMerge() 必须在 `gh pr merge` **之前**重新确认否决。
+  //         review+test 窗口长达数十分钟，正是用户最想反悔的时候；只在取活时
+  //         检查会因为 in-flight 的 processIssueInner 跑完而失效（Agent B #1）。
+  {
+    const fm = pipe.split('async function finishMerge(')[1]?.split('\n}')[0] || '';
+    const iVeto = fm.indexOf('isRejectedIssue');
+    const iMerge = fm.indexOf("'merge'");
+    if (iVeto === -1) fail('finishMerge() 未在合并前重新检查 isRejectedIssue（运行中 /reject 仍会被自动合并）');
+    else if (iMerge === -1 || iVeto > iMerge) fail('finishMerge() 的否决检查必须位于 gh pr merge 之前（否则形同没有）');
+    else ok('finishMerge() 在 gh pr merge 之前重新确认 /reject（合并不可逆的唯一守卫）');
+    if (/return\s*\{\s*skipped:\s*'rejected'/.test(fm)) ok('finishMerge() 否决时返回 skipped:rejected（不静默吞掉）');
+    else fail("finishMerge() 检测到 /reject 时未返回 { skipped: 'rejected' }");
+  }
+
+  // 14c. workflow 两个标签互斥（templates 源 + live 副本都要有）
+  for (const wfPath of ['templates/issue-agent.yml', '.github/workflows/issue-agent.yml']) {
+    const wf = readFileSync(path.join(ROOT, wfPath), 'utf8');
+    const rejectBlock = wf.split('// 1) explicit /reject')[1]?.split('// 2) /approve')[0] || '';
+    const approveBlock = wf.split('// 2) /approve')[1]?.split('// 3) brand-new')[0] || '';
+    if (/removeLabels/.test(rejectBlock) && /agent-approved/.test(rejectBlock)) ok(`${wfPath}: reject 分支移除 agent-approved`);
+    else fail(`${wfPath}: reject 分支未同时出现 removeLabels 与 agent-approved（否决必须是真取消）`);
+    if (/removeLabels/.test(approveBlock) && /agent-rejected/.test(approveBlock)) ok(`${wfPath}: approve 分支移除 agent-rejected`);
+    else fail(`${wfPath}: approve 分支未移除 agent-rejected（改主意后无法重新批准）`);
+    // 存量 issue 可能同时带两个标签（旧行为遗留）；/approve 必须能把它救回来，
+    // 否则用户看到 approve 什么都没发生（Agent B #2）。
+    if (/labels\.includes\(REJECTED\)/.test(approveBlock)) ok(`${wfPath}: approve 分支处理存量双标签（可重新批准）`);
+    else fail(`${wfPath}: approve 分支在存量双标签（agent-approved+agent-rejected）issue 上是 no-op`);
+  }
+}
+
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);

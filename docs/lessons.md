@@ -314,3 +314,60 @@ PM 下次既不知道"该怎么小范围重提"，也分不清"不许再提"与"
 - 任何"检查存在性再分支"的逻辑都要有**真仓库集成测试**：`try/catch` 兜底路径不会被
   "命令不抛异常"这一事实触发，成为永远不被执行的死代码。
 - 状态机必须能**记录**它声称在度量的事（修复轮次）；整条覆盖写入等于把度量归零。
+
+---
+
+## 19. 「取消」必须移除触发标签：只加否定标签 ≠ 取消
+
+**现象**：产品承诺 `/reject` 可以**取消**一次批准（README、SKILL、Actions 批准评论都这么写），
+但实测否决**不生效**——尤其是**筛选器自动批准**之后（`screenAutoApprove` 默认开启，
+这是目前最常见的"想反悔"场景）：
+
+- Actions 的 reject 分支只 `ensureLabel('agent-rejected')`，**从不移除 `agent-approved`**；
+- 本地 watcher 完全按标签取活：`gh issue list --label=agent-approved`，
+  pending 过滤只看 `state.json` 的 `status`，**看不到 `agent-rejected` 这个否定信号**；
+- `'rejected'` 这个终态在全仓**只被读、从未被写**（只在过滤数组里出现）。
+
+⇒ 一个 issue 同时带 `agent-approved` + `agent-rejected` 时，仍会被实现、审查、测试并
+**自动合并**。owner 目前唯一的止损手段是事后关 PR——而**合并是不可逆动作**。
+
+**根因**：
+1. 把"打一个否定标签"当成了"取消"，但**标签驱动的 worker 只认触发标签**——
+   取消的语义就是**移除触发标签**；
+2. 取活判定是内联的匿名 filter（`pipeline.mjs` 里写死的终态数组），无法被单测断言，
+   因而"否定优先"这条规则从未被验证；
+3. 状态机的 `rejected` 是**不可达终态**——没有任何代码路径写入它，
+   状态机无法表达"已被否决"。
+
+**修复**：
+- Actions 让两个标签**互斥**：reject 分支 `removeLabels(['agent-approved'])`，
+  approve 分支对称 `removeLabels(['agent-rejected'])`（用户改主意后可重新批准）；
+  两处失败都 `core.warning`，不静默（404=标签本来不在，属正常）。
+- 新增纯函数 `lib.selectPendingIssues(issues, state)`：先判 `agent-rejected` → **硬排除**，
+  再看终态；watch 循环改调它，不再内联写死数组。`lib.isRejectedIssue()` 供
+  `processIssue()` 开头复用：带否决标签 → 置 `status='rejected'` 终态、写日志、
+  `return { skipped: 'rejected' }`（不留言、不重入）；`run --issue` 手动路径同样尊重否决
+  （除非显式 `--force`）。
+- `scripts/validate.mjs` check 14：纯函数断言（双标签 issue 必被排除、终态排除、
+  全新 issue 回归）+ 两个 yml 的 reject/approve 分支文本断言。
+- **合并前守卫**：只在取活/开头检查会被 in-flight 路径绕过（review+test 跑完照常
+  `gh pr merge`）。`finishMerge()` 在真正 `gh pr merge` **之前**重新取 issue 标签，
+  带 `agent-rejected` → 置 `rejected` 终态、留言、**不合并**；取不到标签（无法确认）
+  → 失败关闭（`needs_human`），因为合并不可逆。check 14 另断言该检查位于
+  `gh pr merge` 之前且返回 `{ skipped: 'rejected' }`。
+- `/approve` 对**存量双标签**（旧行为遗留 `agent-approved`+`agent-rejected`）不再 no-op：
+  条件加上 `labels.includes(REJECTED)`，重新走一遍批准流程。
+
+**边界**：若实现**已经在跑**，`/reject` **不会中断**运行中的 pi 会话；
+但下一轮轮询不会再接管，**且合并前守卫会阻止自动合并**（`finishMerge` 在 `gh pr merge`
+前重新确认标签，取不到标签则失败关闭）。这一边界已写进 README/SKILL，否则只是把
+"承诺-实现不一致"换个位置。
+
+**教训**：
+- 标签驱动的取活逻辑，**取消 = 移除触发标签**；否定标签只是补充信号，
+  必须被取活判定当作**硬性排除**，否则会留下"已取消但仍在跑"的假象。
+- 状态机的终态必须**可达**（有写入点），否则"有终态"只是文档幻觉；
+  本次 `rejected` 就是只被读、从未被写的死状态。
+- 内联条件（匿名 filter）不可测 → 把"该不该取活"抽成纯函数，才能对
+  "否决优先"这类安全语义做自动断言。
+- **合并不可逆**，所以任何"会不会被合并"的判定都必须由纯函数 + 测试守住。

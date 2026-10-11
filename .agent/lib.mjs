@@ -34,6 +34,40 @@ export function resolveTesterCommands(env = process.env) {
   return { build: String(build).trim(), test: String(test).trim() };
 }
 
+// ── /reject 语义（issue #14）───────────────────────────────────────
+// 产品承诺「/reject 可取消一次批准」，但标签驱动的 worker 只看触发标签：
+// 只加一个否定标签 agent-rejected 而不移除 agent-approved，issue 仍会被实现、
+// 审查、测试并**自动合并**（合并不可逆）。因此取消必须 (1) 两个标签互斥，
+// (2) 取活判定把 agent-rejected 当**硬排除**，让状态机有可达的 rejected 终态。
+// 单一实现，pipeline 与 validate 共用（避免两份归一化逻辑漂移）。
+export const REJECTED_LABEL = 'agent-rejected';
+export const APPROVED_LABEL = 'agent-approved';
+
+/** Normalize an issue's labels to plain names (string[] or GitHub's [{name}]). */
+export function labelNames(issue) {
+  return (issue?.labels || [])
+    .map(l => (typeof l === 'string' ? l : l?.name))
+    .filter(Boolean);
+}
+
+/** True when the issue carries the /reject label (hard veto, beats approval). */
+export function isRejectedIssue(issue) {
+  return labelNames(issue).includes(REJECTED_LABEL);
+}
+
+// Which issues should the watch loop pick up?
+//  * agent-rejected → NEVER (veto wins even if agent-approved is still present)
+//  * terminal state (merged/failed/needs_human/rejected) → no
+// Pure + explicit so it can be asserted without gh/network.
+export function selectPendingIssues(issues = [], state = {}) {
+  const TERMINAL = ['merged', 'failed', 'needs_human', 'rejected'];
+  return (issues || []).filter(it => {
+    if (isRejectedIssue(it)) return false;      // 否决优先
+    const c = state[it.number];
+    return !c || !TERMINAL.includes(c.status);
+  });
+}
+
 // Prepare the branch Agent A implements on.
 // FIRST round: branch off `origin/<base>`. FIX round: the PR branch already
 // exists upstream, so we MUST continue on it — `git checkout -B <branch>
