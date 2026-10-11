@@ -350,10 +350,18 @@ PM 下次既不知道"该怎么小范围重提"，也分不清"不许再提"与"
   （除非显式 `--force`）。
 - `scripts/validate.mjs` check 14：纯函数断言（双标签 issue 必被排除、终态排除、
   全新 issue 回归）+ 两个 yml 的 reject/approve 分支文本断言。
+- **合并前守卫**：只在取活/开头检查会被 in-flight 路径绕过（review+test 跑完照常
+  `gh pr merge`）。`finishMerge()` 在真正 `gh pr merge` **之前**重新取 issue 标签，
+  带 `agent-rejected` → 置 `rejected` 终态、留言、**不合并**；取不到标签（无法确认）
+  → 失败关闭（`needs_human`），因为合并不可逆。check 14 另断言该检查位于
+  `gh pr merge` 之前且返回 `{ skipped: 'rejected' }`。
+- `/approve` 对**存量双标签**（旧行为遗留 `agent-approved`+`agent-rejected`）不再 no-op：
+  条件加上 `labels.includes(REJECTED)`，重新走一遍批准流程。
 
-**边界**：若实现**已经在跑**，`/reject` **不会中断**运行中的 pi 会话（不在本次范围）；
-但**下一次轮询不会再接管**，且 PR 不会被自动合并。这一边界必须写进 README/SKILL，
-否则只是把"承诺-实现不一致"换个位置。
+**边界**：若实现**已经在跑**，`/reject` **不会中断**运行中的 pi 会话；
+但下一轮轮询不会再接管，**且合并前守卫会阻止自动合并**（`finishMerge` 在 `gh pr merge`
+前重新确认标签，取不到标签则失败关闭）。这一边界已写进 README/SKILL，否则只是把
+"承诺-实现不一致"换个位置。
 
 **教训**：
 - 标签驱动的取活逻辑，**取消 = 移除触发标签**；否定标签只是补充信号，

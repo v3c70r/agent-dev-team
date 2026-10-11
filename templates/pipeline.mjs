@@ -403,16 +403,14 @@ async function processIssueInner(issue, force = false) {
 
   if (process.env.TEST_SKIP === '1') {
     commentOnIssue(issue.number, `🧪 TEST_SKIP=1，跳过功能测试。`);
-    await finishMerge(issue.number, s2[issue.number].pr || pr.number);
-    return { merged: true };
+    return await finishMerge(issue.number, s2[issue.number].pr || pr.number);
   }
 
   const maxFixes = parseInt(process.env.MAX_TEST_FIXES || '2', 10);
   for (let f = 0; f <= maxFixes; f++) {
     const t = runTester(issue.number, s2[issue.number].pr || pr.number, s2[issue.number].branch);
     if (t.pass) {
-      await finishMerge(issue.number, s2[issue.number].pr || pr.number);
-      return { merged: true };
+      return await finishMerge(issue.number, s2[issue.number].pr || pr.number);
     }
     if (f === maxFixes) {
       commentOnIssue(issue.number, `❌ 功能测试在 ${maxFixes + 1} 次尝试后仍失败，PR 保持开放，请人工处理。`);
@@ -430,6 +428,29 @@ async function processIssueInner(issue, force = false) {
 }
 
 async function finishMerge(issueNum, prNum) {
+  // 合并不可逆 —— 在真正 `gh pr merge` 之前重新取一次 issue 标签确认 /reject。
+  // review + test 窗口长达数十分钟，正是用户最想反悔的时候；只在取活时检查
+  // 无法覆盖"实现已经在跑"的 in-flight 路径（issue #14 明确承诺"PR 不会被
+  // 自动合并"）。取不到标签 = 无法确认 → 失败关闭，绝不做不可逆动作。
+  let freshIssue;
+  try {
+    freshIssue = ghJson(['issue', 'view', String(issueNum), '--json', 'labels']);
+  } catch (e) {
+    const sf = state.load();
+    sf[issueNum] = mergeIssueState(sf[issueNum], { status: 'needs_human' });
+    state.save(sf);
+    log(issueNum, `状态: needs_human（合并前无法确认 /reject 标签: ${e.message}）`);
+    try { commentOnIssue(issueNum, `⚠️ 合并前无法确认 /reject 状态（\`${e.message}\`），为安全起见未自动合并 PR #${prNum}，请人工处理。`); } catch {}
+    return { skipped: 'needs_human' };
+  }
+  if (isRejectedIssue(freshIssue)) {
+    const sr = state.load();
+    sr[issueNum] = mergeIssueState(sr[issueNum], { status: 'rejected' });
+    state.save(sr);
+    log(issueNum, `状态: rejected（合并前检查到 /reject，已阻止自动合并 PR #${prNum}）`);
+    try { commentOnIssue(issueNum, `🛑 合并前检测到 /reject，已**阻止自动合并** PR #${prNum}。该 PR 保持开放，等待人工处理。`); } catch {}
+    return { skipped: 'rejected' };
+  }
   // GitHub forbids approving your own PR. If A/B share one account,
   // record B's approval as a comment instead of a formal review.
   try {
@@ -446,7 +467,7 @@ async function finishMerge(issueNum, prNum) {
     sf[issueNum].status = 'needs_human';
     state.save(sf);
     log(issueNum, '状态: needs_human (merge blocked)');
-    return;
+    return { skipped: 'needs_human' };
   }
   const s = state.load();
   if (!s[issueNum]) s[issueNum] = {};
@@ -454,6 +475,7 @@ async function finishMerge(issueNum, prNum) {
   state.save(s);
   commentOnIssue(issueNum, `🎉 已合并 (PR #${prNum})。issue 将被自动关闭。`);
   log(issueNum, '状态: merged');
+  return { merged: true };
 }
 
 // ── CLI ──

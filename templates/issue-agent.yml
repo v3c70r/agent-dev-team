@@ -96,7 +96,9 @@ jobs:
               }
 
               // 2) /approve → 打标签（并对称移除否决标签，改主意后可重新批准）
-              if (approve && !labels.includes(APPROVED)) {
+              // 存量 issue 可能同时带两个标签（旧行为遗留）：只要带 REJECTED 就必须
+              // 重新走一遍批准流程，否则用户看到 /approve 什么都没发生。
+              if (approve && (labels.includes(REJECTED) || !labels.includes(APPROVED))) {
                 await removeLabels(issue, ['agent-rejected']);
                 await addLabel(issue, APPROVED, '#0a7d32');
                 await github.rest.issues.createComment({

@@ -303,6 +303,20 @@ let doctorHumanOut = '';
   if (/'rejected'/.test(pipe) && /issue',\s*'view'[\s\S]{0,120}labels/.test(pipe)) ok('pipeline 手动 run 路径带上 labels（否决可见）');
   else fail('templates/pipeline.mjs 手动 run 路径未取 labels（无法识别 /reject）');
 
+  // 14b-2. 合并不可逆：finishMerge() 必须在 `gh pr merge` **之前**重新确认否决。
+  //         review+test 窗口长达数十分钟，正是用户最想反悔的时候；只在取活时
+  //         检查会因为 in-flight 的 processIssueInner 跑完而失效（Agent B #1）。
+  {
+    const fm = pipe.split('async function finishMerge(')[1]?.split('\n}')[0] || '';
+    const iVeto = fm.indexOf('isRejectedIssue');
+    const iMerge = fm.indexOf("'merge'");
+    if (iVeto === -1) fail('finishMerge() 未在合并前重新检查 isRejectedIssue（运行中 /reject 仍会被自动合并）');
+    else if (iMerge === -1 || iVeto > iMerge) fail('finishMerge() 的否决检查必须位于 gh pr merge 之前（否则形同没有）');
+    else ok('finishMerge() 在 gh pr merge 之前重新确认 /reject（合并不可逆的唯一守卫）');
+    if (/return\s*\{\s*skipped:\s*'rejected'/.test(fm)) ok('finishMerge() 否决时返回 skipped:rejected（不静默吞掉）');
+    else fail("finishMerge() 检测到 /reject 时未返回 { skipped: 'rejected' }");
+  }
+
   // 14c. workflow 两个标签互斥（templates 源 + live 副本都要有）
   for (const wfPath of ['templates/issue-agent.yml', '.github/workflows/issue-agent.yml']) {
     const wf = readFileSync(path.join(ROOT, wfPath), 'utf8');
@@ -312,6 +326,10 @@ let doctorHumanOut = '';
     else fail(`${wfPath}: reject 分支未同时出现 removeLabels 与 agent-approved（否决必须是真取消）`);
     if (/removeLabels/.test(approveBlock) && /agent-rejected/.test(approveBlock)) ok(`${wfPath}: approve 分支移除 agent-rejected`);
     else fail(`${wfPath}: approve 分支未移除 agent-rejected（改主意后无法重新批准）`);
+    // 存量 issue 可能同时带两个标签（旧行为遗留）；/approve 必须能把它救回来，
+    // 否则用户看到 approve 什么都没发生（Agent B #2）。
+    if (/labels\.includes\(REJECTED\)/.test(approveBlock)) ok(`${wfPath}: approve 分支处理存量双标签（可重新批准）`);
+    else fail(`${wfPath}: approve 分支在存量双标签（agent-approved+agent-rejected）issue 上是 no-op`);
   }
 }
 
