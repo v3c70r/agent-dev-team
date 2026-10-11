@@ -36,14 +36,24 @@ jobs:
               return;
             }
 
-            async function ensureLabel(issue, name, color) {
-              const has = (issue.labels || []).some(l => l.name === name);
-              if (!has) {
+            async function addLabel(issue, name, color) {
+              try {
+                await github.rest.issues.addLabels({
+                  owner, repo, issue_number: issue.number, labels: [name]
+                });
+              } catch (e) { core.warning('add label ' + name + ': ' + e.message); }
+            }
+            // 取消批准必须真正移除触发标签：只加否定标签 ≠ 取消（见 docs/lessons.md #19）
+            async function removeLabels(issue, names) {
+              for (const name of names) {
                 try {
-                  await github.rest.issues.addLabels({
-                    owner, repo, issue_number: issue.number, labels: [name]
+                  await github.rest.issues.removeLabel({
+                    owner, repo, issue_number: issue.number, name
                   });
-                } catch (e) { core.warning('label ' + name + ': ' + e.message); }
+                } catch (e) {
+                  // 404 = 标签本来就不在（正常）；其它错误必须显式告警，不可静默
+                  if (e.status !== 404) core.warning('remove label ' + name + ': ' + e.message);
+                }
               }
             }
             const { owner, repo } = context.repo;
@@ -69,24 +79,31 @@ jobs:
               const approve = bodies.some(b => /^\/approve\b/i.test(b));
               const reject = bodies.some(b => /^\/reject\b/i.test(b));
 
-              // 1) explicit /reject → tag and stop
-              if (reject && !labels.includes(REJECTED)) {
-                await ensureLabel(issue, REJECTED, '#6e7681');
+              // 1) explicit /reject → 取消批准（标签互斥）+ 标记不再接管
+              if (reject && (labels.includes(APPROVED) || !labels.includes(REJECTED))) {
+                // 移除触发标签 = 真正取消；只加 agent-rejected 会留下
+                // "已取消但仍被实现并自动合并"的假象
+                await removeLabels(issue, ['agent-approved']);
+                await addLabel(issue, REJECTED, '#6e7681');
                 await github.rest.issues.createComment({
                   owner, repo, issue_number: issue.number,
-                  body: `@${TARGET} 已标记为不予实现（/reject）。本 issue 将不再被 agent 接管。`
+                  body: `@${TARGET} 已取消批准并标记为不予实现（/reject），\`agent-approved\` 已移除。` +
+                        '本 issue 将不再被 agent 接管；若实现已在运行中，本次 /reject 不会中断当前会话，' +
+                        '但该 PR 不会被自动合并。'
                 });
                 touched.push('#' + issue.number + ' rejected');
                 continue;
               }
 
-              // 2) /approve → tag, notify that local pipeline will pick up
+              // 2) /approve → 打标签（并对称移除否决标签，改主意后可重新批准）
               if (approve && !labels.includes(APPROVED)) {
-                await ensureLabel(issue, APPROVED, '#0a7d32');
+                await removeLabels(issue, ['agent-rejected']);
+                await addLabel(issue, APPROVED, '#0a7d32');
                 await github.rest.issues.createComment({
                   owner, repo, issue_number: issue.number,
                   body: `@${TARGET} ✅ 已批准 #${issue.number}。本地 agent pipeline 启动后将自动开始实现（` +
-                        '创建分支 → 实现 → PR）。若想取消，回复 `/reject`。'
+                        '创建分支 → 实现 → PR）。若想取消，回复 `/reject`（会移除 `agent-approved`，' +
+                        '下一次轮询不再接管；已在运行的实现不会被中断，但 PR 不会被自动合并）。'
                 });
                 touched.push('#' + issue.number + ' approved');
                 continue;
@@ -94,7 +111,7 @@ jobs:
 
               // 3) brand-new issue with no decision → notify user to approve or reject
               if (!labels.includes(SEEN) && !labels.includes(APPROVED) && !labels.includes(REJECTED)) {
-                await ensureLabel(issue, SEEN, '#d4a72c');
+                await addLabel(issue, SEEN, '#d4a72c');
                 const title = issue.title.slice(0, 80);
                 await github.rest.issues.createComment({
                   owner, repo, issue_number: issue.number,

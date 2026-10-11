@@ -31,7 +31,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, copyFileSync, symlinkSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { detectBase, mergeIssueState, prepareImplementerBranch, resolvePi, resolveTesterCommands, sh } from './lib.mjs';
+import { detectBase, isRejectedIssue, mergeIssueState, prepareImplementerBranch, resolvePi, resolveTesterCommands, selectPendingIssues, sh } from './lib.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const AGENT = path.join(ROOT, '.agent');
@@ -332,6 +332,16 @@ async function processIssue(issue, force = false) {
 
 async function processIssueInner(issue, force = false) {
   const s = state.load();
+  // /reject 是硬性否决（issue #14）：标签驱动的取活只加否定标签不等于取消，
+  // 必须把 agent-rejected 当作硬排除，并在实现/合并前落成终态 `rejected`。
+  // 边界：若实现已在运行，本函数不会中断正在跑的 pi 会话（不在本 PR 范围），
+  // 但下一轮不再接管，PR 也不会被自动合并（见 docs/lessons.md #19）。
+  if (isRejectedIssue(issue) && !force) {
+    s[issue.number] = mergeIssueState(s[issue.number], { status: 'rejected', title: issue.title });
+    state.save(s);
+    log(issue.number, '状态: rejected（issue 带 agent-rejected 标签，硬性跳过实现与合并）');
+    return { skipped: 'rejected' };
+  }
   const cur = s[issue.number];
   const terminal = ['merged', 'rejected', 'failed'];
   if (cur && terminal.includes(cur.status) && !force) return { skipped: cur.status };
@@ -478,7 +488,7 @@ async function main() {
     const list = issueNum ? [{ number: issueNum, title: '', body: '' }] : approvedIssues();
     for (const issue of list) {
       const full = issueNum
-        ? (await gh(['issue', 'view', String(issueNum), '--json', 'number,title,body']))
+        ? (await gh(['issue', 'view', String(issueNum), '--json', 'number,title,body,labels']))
         : issue;
       await processIssue(typeof full === 'string' ? JSON.parse(full) : full, force);
     }
@@ -518,10 +528,8 @@ async function main() {
     try {
       const issues = approvedIssues();
       const s = state.load();
-      const pending = issues.filter(it => {
-        const c = s[it.number];
-        return !c || !['merged', 'failed', 'needs_human', 'rejected'].includes(c.status);
-      });
+      // 否决优先 + 终态排除（可测试的纯函数；见 templates/lib.mjs）
+      const pending = selectPendingIssues(issues, s);
       if (pending.length === 0) {
         console.log(`[${ts()}] 💤 idle — 等待新的 agent-approved issue …`);
         pollFailures = 0;

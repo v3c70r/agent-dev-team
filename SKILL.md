@@ -139,10 +139,15 @@ gh workflow run issue-agent.yml
 
 ## 运行手册（告诉用户）
 
+> **`/reject` 的边界**：若实现**已经在运行**，`/reject` **不会中断**当前 pi 会话（不在模板范围）；
+> 它保证的是**下一次轮询不再接管**，且该 PR **不会被自动合并**。合并不可逆，所以取消必须在
+> 取活层就生效（见 [`docs/lessons.md`](docs/lessons.md) #19）。
+
 | 操作 | 命令 |
 |---|---|
 | 提需求 | GitHub 建 issue（写清：背景/验收标准/建议范围） |
-| 批准 | issue 下回复 `/approve`（否决 `/reject`） |
+| 批准 | issue 下回复 `/approve`（会移除 `agent-rejected`，可反复改主意） |
+| 撤回批准 | issue 下回复 `/reject` —— 移除 `agent-approved`（真正取消触发标签）+ 打上 `agent-rejected`；此后不再被接管，也不会被自动合并 |
 | 看流水线 | `tmux attach -t agent`（Ctrl-b d 脱离） |
 | 状态机 | `npm run agent:status` |
 | 单独复审 | `node .agent/pipeline.mjs review --pr <N> --issue <M>` |
