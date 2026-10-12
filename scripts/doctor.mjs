@@ -246,6 +246,26 @@ const CHECKS = [
     },
   },
   {
+    name: 'pipeline/lib 一致',
+    run() {
+      try {
+        const pj = readFileSync(path.join(ROOT, '.agent', 'pipeline.mjs'), 'utf8');
+        const lj = readFileSync(path.join(ROOT, '.agent', 'lib.mjs'), 'utf8');
+        const m = pj.match(/import\s*\{([^}]+)\}\s*from\s*'\.\/lib\.mjs'/);
+        if (!m) return { status: 'warn', detail: '未在 .agent/pipeline.mjs 找到 lib.mjs 导入（跳过）' };
+        const need = m[1].split(',').map(x => x.trim()).filter(Boolean);
+        const have = new Set([...lj.matchAll(/export\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)|export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)/g)].map(x => x[1] || x[2]));
+        const missing = need.filter(n => !have.has(n));
+        if (missing.length) {
+          return { status: 'fail',
+                   detail: `.agent/lib.mjs 缺少导出：${missing.join(', ')}`,
+                   fix: '升级时通常只复制了 pipeline.mjs —— 请从 templates/ 同时复制 pipeline.mjs 与 lib.mjs' };
+        }
+        return { status: 'pass', detail: `pipeline.mjs 需要的 ${need.length} 个符号 lib.mjs 均已导出` };
+      } catch (e) { return { status: 'warn', detail: '无法校验 pipeline/lib 一致性：' + e.message }; }
+    },
+  },
+  {
     name: 'labels',
     run() {
       let out;
