@@ -94,7 +94,7 @@ CI / 脚本需要机器可读结果时，加 `--json`（等价 `npm run doctor:j
 
 **GitHub 标签**（triage 与筛选依赖，缺失会导致打标签失败）：
 ```bash
-for l in agent-seen agent-approved agent-rejected pm-proposal pm-screened agent-auto-approved skill-feedback; do gh label create "$l" --force; done
+for l in agent-seen agent-approved agent-rejected pm-proposal pm-screened agent-auto-approved auto-approve skill-feedback; do gh label create "$l" --force; done
 gh issue create ... 不需要预建，但 label 必须存在
 ```
 
@@ -143,6 +143,31 @@ gh workflow run issue-agent.yml
 ```
 然后建一个**小而真实**的测试 issue → 在 issue 里回复 `/approve` →
 确认 Actions 打上 `agent-approved` 标签且 watcher 在 30s 内开始处理。
+
+## 两个进阶能力（安装后即可用）
+
+### 1) `auto-approve` 标签 —— 受信 agent 的 issue 免人工批准
+
+给 issue 打上 `auto-approve` 标签，triage 会**直接批准**（不再 @ 你等 `/approve`），
+流水线立即接手。适用场景：**由主 agent 基于实测证据新建的 issue**（它已经做过调查）。
+
+护栏：
+- **必须显式打标签**（打标签需要仓库写权限，这本身就是信任边界）
+- **每周自动批准上限** `AUTO_APPROVE_WEEKLY_CAP`（默认 10）；超额则回退为"等你 `/approve`"
+- `/reject` 随时可撤销批准（会撤回并停止实现）
+
+### 2) 依赖声明 `Depends on: #N` —— 批量建 issue 也不会乱序
+
+issue 正文里写一行（任一写法均可）：
+
+```
+Depends on: #58, #59      /  Blocked by: #58   /  阻塞于 #58、#59   /  依赖：#58
+```
+
+pipeline 在开工前会检查这些前置 issue：**只要有未关闭的，就不开始实现**，在 issue 里
+留言说明一次（之后安静等待，每 5 分钟复查一次），依赖全部关闭后自动开工并留言"依赖已满足"。
+
+这让你可以放心地把一整批有先后关系的 issue 一起 `auto-approve` 出去。
 
 ## 运行手册（告诉用户）
 

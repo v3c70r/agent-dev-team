@@ -83,6 +83,7 @@ pi 会按 [`SKILL.md`](SKILL.md) 的步骤：做 preflight 检查 → 询问你�
 | `SCREEN_PROVIDER` / `SCREEN_MODEL` | `deepseek` / `deepseek-v4-flash` | 提案筛选模型 |
 | `SCREEN_AUTO_APPROVE` | 1（config `screenAutoApprove`） | 筛选通过即自动实现 |
 | `SCREEN_AUTO_CAP_WEEKLY` | 5（config `screenAutoCapWeekly`） | 每周自动实现上限（防失控） |
+| `AUTO_APPROVE_WEEKLY_CAP` | 10 | 带 `auto-approve` 标签的 issue 每周自动批准上限 |
 | — | — | 筛选结论落在 `docs/proposal-audit.md`（append-only）：REJECT=不要重提、SPLIT=可按更小范围重提；该文件会被**强制注入 PM 上下文** |
 | `PM_HOUR_UTC` + `PM_WINDOW_*` | 17:00 + 16:30–00:30 | PM 运行时刻与**折扣时段窗口** |
 | `PI_BIN` | 自动解析 | 显式指定 pi 可执行文件 |

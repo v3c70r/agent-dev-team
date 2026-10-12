@@ -4,11 +4,12 @@
 
 | 组件 | 位置 | 职责 | 是否需要 LLM |
 |---|---|---|---|
-| Triage | `.github/workflows/issue-agent.yml`（Actions，定时+评论事件） | 轮询新 issue、通知 owner、`/approve`→打标签、`/reject`→关闭 | 否（确定性） |
+| Triage | `.github/workflows/issue-agent.yml`（Actions，定时+评论事件） | 轮询新 issue、通知 owner、`/approve`→打标签、`/reject`→关闭、**`auto-approve` 标签→直接批准（周上限）** | 否（确定性） |
 | Agent A | `.agent/pipeline.mjs` → `prompts/implementer.md`；本机 pi | 读 issue → 建分支 → 实现 → push → 开 PR | 是 |
 | Agent B | 同上 → `prompts/reviewer.md`；**独立模型/会话** | `gh pr diff` → PR 评论 → `RESULT: APPROVE/REQUEST_CHANGES` | 是 |
 | Agent C | 同上 → `runTester()` | 分离 worktree + 真实构建/测试 → 通过则合并 | 否 |
 | PM Agent | `.agent/pm/run.mjs` + `pm/prompt.md`；定时 | 竞品调研 → `docs/product-review.md` + `pm-proposal` issue | 是 |
+| **依赖闸门** | `pipeline.mjs` 的 `parseDependencies()` | 正文 `Depends on: #N` → 前置未关闭则不开工（每 5 分钟复查，解除后自动开工） | 否 |
 | **筛选 Agent** | `.agent/pm/screen.mjs` + `pm/screener.md`；定时 | 独立评估提案价值与 scope（结合 A/B/C 能力边界）→ 通过则自动批准，否则关闭并写入 `docs/proposal-audit.md`（REJECT/SPLIT） | 是 |
 | **审计记忆** | `docs/proposal-audit.md`（筛选器 append-only 拥有） | REJECT=禁止重提；SPLIT=按拆分方案小范围重提；每轮强制注入 PM 上下文包 | 否 |
 | Supervisor | `.agent/supervisor.sh`, `.agent/pm/supervisor.sh` | tmux 常驻、崩溃自愈、注入 env | 否 |
@@ -29,7 +30,8 @@
 (issue opened)
       │  Actions triage
       ▼
-  agent-seen ──/approve──▶ agent-approved ──/reject──▶ agent-rejected (终态)
+  agent-seen ──/approve──▶ agent-approved
+             └─auto-approve─▶ agent-approved (自动, 周上限) ──/reject──▶ agent-rejected (终态)
                                    │  watcher 30s 内接手
                                    ▼
    implementing ─▶ pr_open ─▶ reviewing ⇄(REQUEST_CHANGES ≤N 轮) ─▶ approved

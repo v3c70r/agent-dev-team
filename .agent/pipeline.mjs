@@ -43,6 +43,31 @@ const BASE = detectBase();
 
 // ── upstream feedback (self-improvement of the agent-dev-team skill) ──
 // .agent/config.json: { "upstream": "<owner>/<repo>", "feedbackOptIn": true }
+
+// ── issue dependencies ──
+// Issues may declare prerequisites in their body, e.g.
+//   "Depends on: #12, #13"  /  "Blocked by: #12"  /  "阻塞于 #12"
+// The pipeline refuses to start such an issue while any prerequisite is open,
+// so a freshly created batch with dependencies can be auto-approved safely.
+function parseDependencies(body) {
+  const m = String(body || '').match(/^\s*(?:Depends on|Blocked by|Depends|阻塞于|依赖于|依赖)\s*[:：]?\s*((?:#\d+[\s,，、]*)+)/im);
+  if (!m) return [];
+  return [...m[1].matchAll(/#(\d+)/g)].map(x => parseInt(x[1], 10));
+}
+function openDependencies(issue) {
+  const deps = parseDependencies(issue && issue.body);
+  if (!deps.length) return [];
+  const open = [];
+  for (const n of deps) {
+    if (n === Number(issue.number)) continue;
+    try {
+      const st = ghJson(['issue', 'view', String(n), '--json', 'state,title']);
+      if (st.state === 'OPEN') open.push({ number: n, title: st.title });
+    } catch { /* unknown issue → treat as non-blocking */ }
+  }
+  return open;
+}
+
 function loadConfig() {
   try { return JSON.parse(readFileSync(path.join(AGENT, 'config.json'), 'utf8')); } catch { return {}; }
 }
@@ -348,6 +373,43 @@ async function processIssueInner(issue, force = false) {
 
   const branch = cur?.branch || `agent/${issue.number}`;
   let pr = prForBranch(branch) || openPrFor(issue.number, branch) || (cur?.pr ? { number: cur.pr } : null);
+
+  // 0) DEPENDENCIES — never start work whose prerequisites are still open
+  if (!pr) {
+    // throttle dependency re-checks (the watcher ticks every 30s)
+    const sT = state.load();
+    const lastCheck = sT[issue.number]?.blockedCheckedAt ? Date.parse(sT[issue.number].blockedCheckedAt) : 0;
+    const blockedFresh = sT[issue.number]?.status === 'blocked' && (Date.now() - lastCheck) < 5 * 60_000;
+    if (blockedFresh) return { skipped: 'blocked' };
+    const blockedBy = openDependencies(issue);
+    if (blockedBy.length) {
+      const list = blockedBy.map(d => `#${d.number} (${d.title})`).join(', ');
+      log(issue.number, `blocked: 等待依赖 ${list}`);
+      const sB = state.load();
+      if (!sB[issue.number]) sB[issue.number] = {};
+      const firstNotice = !sB[issue.number].blockedNotified;
+      sB[issue.number].status = 'blocked';
+      sB[issue.number].blockedBy = blockedBy.map(d => d.number);
+      sB[issue.number].blockedCheckedAt = new Date().toISOString();
+      if (firstNotice) sB[issue.number].blockedNotified = true;
+      state.save(sB);
+      if (firstNotice) {
+        try { commentOnIssue(issue.number, `⏳ 该 issue 声明了依赖，暂不开始实现：等待 ${list} 关闭。\n\n依赖完成后流水线会自动接手（无需操作）。`); } catch {}
+      }
+      return { skipped: 'blocked' };
+    }
+  }
+
+  // dependencies satisfied → clear the blocked marker
+  if (state.load()[issue.number]?.status === 'blocked') {
+    const sc = state.load();
+    sc[issue.number].status = 'pr_open';
+    delete sc[issue.number].blockedBy;
+    delete sc[issue.number].blockedNotified;
+    delete sc[issue.number].blockedCheckedAt;
+    state.save(sc);
+    try { commentOnIssue(issue.number, '✅ 依赖已满足，开始实现。'); } catch {}
+  }
 
   // 1) IMPLEMENT
   if (!cur || (cur.status === 'pr_open' && (!pr || force))) {
