@@ -371,3 +371,54 @@ PM 下次既不知道"该怎么小范围重提"，也分不清"不许再提"与"
 - 内联条件（匿名 filter）不可测 → 把"该不该取活"抽成纯函数，才能对
   "否决优先"这类安全语义做自动断言。
 - **合并不可逆**，所以任何"会不会被合并"的判定都必须由纯函数 + 测试守住。
+
+---
+
+## 18. 改了 workflow 内联脚本调用的 helper，却忘了它已被重命名 → **所有 triage 全部失败**
+
+**现象**：给 triage 增加 `auto-approve` 标签支持后，新 issue **完全没有被打标签**——
+既没有 `agent-seen`，也没有自动批准。查 Actions 日志：
+```
+ReferenceError: ensureLabel is not defined
+    at eval (... <anonymous>:114:5)
+```
+**根因**：`ensureLabel()` 在早先的 PR（#15，`/reject` 取消批准）中被重命名为 `addLabel()`，
+但我新写的分支仍调用 `ensureLabel`。异常发生在脚本顶层 → **每次 triage 运行都整体失败**，
+于是所有 issue 都停在"无标签"状态（表现完全静默：没有评论、没有标签、没有错误提示给用户）。
+
+**修复**：
+1. 调用点改为 `addLabel`；
+2. `scripts/validate.mjs` 新增两道自动检查，专治这一类：
+   - **抽取 + 包装 + 语法检查**：把 `issue-agent.yml` 的 `script: |` 块按缩进抽出，
+     用 `(async () => { … })();` 包装（与 `actions/github-script` 的执行环境一致，
+     否则顶层 `return`/`await` 会被判为语法错误），再 `node --check`；
+   - **未定义 helper 检测**：收集 `await <name>(` 调用与 `function`/`const` 定义做差集
+     （先剥离注释与字符串字面量，否则字符串里的 "approval (" 会误报）。
+
+**教训**：
+- workflow 内联脚本是**没有类型检查与引用检查的盲区**，必须给它加语法/引用检查；
+- 检查本身要**验证能抓出目标 bug**（我们注入 `ensureLabel` 回放验证过），否则它只是装饰。
+
+---
+
+## 19. 升级时只复制了一半（pipeline.mjs 而没复制 lib.mjs）→ watcher 崩溃重启循环
+
+**现象**：把模板同步到消费者仓库后，watcher 每 10 秒崩溃重启：
+```
+SyntaxError: The requested module './lib.mjs' does not provide an export named 'isRejectedIssue'
+```
+**根因**：`pipeline.mjs` 与 `lib.mjs` 是**一对**文件，但升级时只复制了前者；
+消费仓库里的 `lib.mjs` 还是旧版本（缺少 `isRejectedIssue`/`mergeIssueState`/
+`prepareImplementerBranch`/`resolveTesterCommands`/`selectPendingIssues`）。
+崩在**模块导入期**，所以连 `status` 子命令都跑不起来。
+
+**修复**：
+1. 同步 `lib.mjs`（一并推送）；
+2. `scripts/doctor.mjs` 新增 **pipeline/lib 导出一致性**检查：解析 pipeline 的
+   `import { … } from './lib.mjs'` 与本仓库 `lib.mjs` 的 `export`，比对缺失项并给出
+   明确修复建议（"从 templates/ 同时复制两个文件"）。doctor 在**目标仓库目录**下运行，
+   所以任何消费者仓库也能自查；
+3. SKILL.md 的升级说明强调：**整组复制**，不要只挑单个文件。
+
+**教训**：模块化拆分（把逻辑从 pipeline 挪进 lib）会**把"单文件升级"变成"多文件升级"**，
+必须同时提供（a）版本一致性自检、（b）面向使用者的"整组升级"指引。
