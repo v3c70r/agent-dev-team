@@ -24,20 +24,27 @@ PM Agent（可选，定时折扣时段）──▶ 竞品调研 ──▶ 提案
 
 ## 第一步：Preflight（开始前必须逐项确认）
 
-先运行 `npm run doctor`，按输出逐项修复，**全绿（0 退出）再继续**。
-若目标仓库尚未安装该脚本，可在目标仓库目录下运行
-`node <agent-dev-team 技能目录>/scripts/doctor.mjs`（它会自检当前目录所在仓库）。
+在**目标仓库目录下**运行 doctor，按输出逐项修复，**全绿（0 退出）再继续**：
+
+```bash
+cd /path/to/your-repo
+node /path/to/agent-dev-team/scripts/doctor.mjs      # 自检"当前目录所在的仓库"
+```
+
+> doctor 是**技能自带的工具**，不需要复制进目标仓库（它用 `process.cwd()` 作为检查目标）。
+> 若你希望目标仓库里也能 `npm run doctor`，在它的 package.json 里加一条指向技能目录的
+> script 即可（例如 `"doctor": "node /path/to/agent-dev-team/scripts/doctor.mjs"`）。
 
 CI / 脚本需要机器可读结果时，加 `--json`（等价 `npm run doctor:json`）输出
 `{ ok, checks: [{ name, status, detail, fix }], summary: { pass, fail, warn } }`，
 退出码不变（有失败仍为非 0），人类表格输出不受影响。
 注意 npm 会把 `> …` banner 打到 stdout，要直接管道解析请用
-`npm run --silent doctor -- --json`（或 `npm run --silent doctor:json`，或直接
-`node scripts/doctor.mjs --json`）。
+`node /path/to/agent-dev-team/scripts/doctor.mjs --json`（若已在目标仓库加了 npm script，
+则用 `npm run --silent doctor -- --json`）。
 
 同时确认（决定 Agent C 如何工作）：
 - 仓库的构建/测试命令：默认为 `npm run build` / `npm test`（doctor 在 `package.json` 有对应
-  scripts 时通过）。**npm 仓库，或显式配置 `AGENT_BUILD_CMD` / `AGENT_TEST_CMD`（非 npm 仓库必需）**
+  scripts 时通过）。**非 npm 仓库必须显式配置 `AGENT_BUILD_CMD` / `AGENT_TEST_CMD`**
   —— Python/Go/Rust 仓库（如 `make build` / `pytest -q`）以及没有 `build`/`test` scripts 的 Node
   仓库，必须设置这两个变量，否则 preflight 会失败；设为空串表示跳过该步骤。doctor 的 `build/test`
   一项会显示 Agent C 实际将执行的命令
