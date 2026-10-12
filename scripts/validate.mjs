@@ -3,7 +3,7 @@
 // Checks: syntax of all mjs/sh, SKILL.md frontmatter, template completeness,
 // doctor self-check, and that the live .agent/ copies match templates/ (no drift).
 import { execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync, readdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -330,6 +330,51 @@ let doctorHumanOut = '';
     // 否则用户看到 approve 什么都没发生（Agent B #2）。
     if (/labels\.includes\(REJECTED\)/.test(approveBlock)) ok(`${wfPath}: approve 分支处理存量双标签（可重新批准）`);
     else fail(`${wfPath}: approve 分支在存量双标签（agent-approved+agent-rejected）issue 上是 no-op`);
+  }
+}
+
+
+// 8. workflow inline script: syntax + undefined helper references
+//    (a real bug shipped once: the triage script called `ensureLabel` after it
+//     had been renamed to `addLabel`, which broke ALL triage runs silently)
+{
+  const wf = readFileSync(path.join(ROOT, '.github/workflows/issue-agent.yml'), 'utf8');
+  const lines = wf.split('\n');
+  const start = lines.findIndex(l => /^\s*script:\s*\|\s*$/.test(l));
+  if (start === -1) fail('workflow: no inline script block found');
+  else {
+    const indent = lines[start].match(/^\s*/)[0].length;
+    let end = lines.length;
+    for (let i = start + 1; i < lines.length; i++) {
+      const l = lines[i];
+      // the block ends at the first non-empty line indented no deeper than `script:`
+      if (l.trim() && l.match(/^\s*/)[0].length <= indent) { end = i; break; }
+    }
+    const body = lines.slice(start + 1, end).map(l => l.slice(Math.min(l.length, indent + 2))).join('\n');
+    const tmp = path.join(ROOT, '.agent', 'tmp', 'wf-check.js');
+    mkdirSync(path.dirname(tmp), { recursive: true });
+    // github-script wraps the body in an async function → wrap the same way so
+    // top-level `return`/`await` are legal when we syntax-check it
+    writeFileSync(tmp, `(async () => {\n${body}\n})();\n`);
+    if (!/github\.rest\.issues/.test(body)) fail('workflow script extraction looks truncated');
+    try { execFileSync('node', ['--check', tmp], { stdio: 'pipe' }); ok('workflow script syntax'); }
+    catch (e) { fail('workflow script syntax: ' + String(e.stderr || e).slice(0, 200)); }
+
+    const defined = new Set([...body.matchAll(/(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/g)].map(m => m[1]));
+    for (const m of body.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/g)) defined.add(m[1]);
+    // strip comments + string bodies so words inside them cannot look like calls
+    const code = body
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/\/\/[^\n]*/g, ' ')
+      .replace(/'(?:[^'\\]|\\.)*'/g, "''")
+      .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+      .replace(/`(?:[^`\\]|\\.)*`/g, '``');
+    const globals = new Set(['github','context','core','process','JSON','Object','Array','String','Number','Date','Math','console','require','fetch','Promise','Set','Map','parseInt','parseFloat','isNaN','Error','RegExp','setTimeout']);
+    // async helpers are always invoked as `await name(...)` in this script
+    const called = new Set([...code.matchAll(/await\s+([A-Za-z_$][\w$]*)\s*\(/g)].map(m => m[1]));
+    const undef = [...called].filter(n => !defined.has(n) && !globals.has(n) && !['if','for','while','switch','catch','return','typeof','function'].includes(n));
+    if (undef.length) fail('workflow script references undefined helper(s): ' + undef.join(', '));
+    else ok('workflow script helpers defined');
   }
 }
 

@@ -135,8 +135,8 @@ jobs:
                   touched.push('#' + issue.number + ' auto-approve cap reached');
                   continue;
                 }
-                await ensureLabel(issue, APPROVED, '#0a7d32');
-                await ensureLabel(issue, AUTO_APPROVED, '#0e8a16');
+                await addLabel(issue, APPROVED, '#0a7d32');
+                await addLabel(issue, AUTO_APPROVED, '#0e8a16');
                 await github.rest.issues.createComment({
                   owner, repo, issue_number: issue.number,
                   body: `@${TARGET} ✅ 该 issue 带 \`${AUTO}\` 标签，**已自动批准**（本周自动批准 ${used + 1}/${cap}）→ 流水线将直接开始实现。\n\n` +
