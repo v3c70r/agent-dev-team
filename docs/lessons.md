@@ -422,3 +422,23 @@ SyntaxError: The requested module './lib.mjs' does not provide an export named '
 
 **教训**：模块化拆分（把逻辑从 pipeline 挪进 lib）会**把"单文件升级"变成"多文件升级"**，
 必须同时提供（a）版本一致性自检、（b）面向使用者的"整组升级"指引。
+
+---
+
+## 20. `gh auth switch` 是全局状态，与并发流水线天然竞争
+
+**背景**：本机同时存在多个常驻会话（qc-gas/维护仓库两个 watcher、两个 PM+筛选、本机探针），
+它们随时可能调用 `gh`（轮询 issue、发评论、关闭 issue、推送）。而 `gh auth switch` 会改写
+**全局** `~/.config/gh/hosts.yml` —— 切换瞬间，另一个进程可能正好用错身份：
+以只读身份去 push/关闭 issue（失败），或以开发者身份去"独立"审查（破坏职责分离）。
+
+**修复/规范**：
+- **禁止在多会话环境下使用 `gh auth switch`**；改用每次调用注入 `GH_TOKEN`：
+  `GH_TOKEN=$(gh auth token --user <account>) gh …`（进程级、并发安全）
+- 模板内置 `reviewerEnv()`：从 `.agent/config.json` 的 `reviewerGhUser`（或 env）取 token，
+  仅注入给 Agent B 的 pi 会话与 approve review 调用；其余角色保持当前账号
+- 批准后还会用该 token 查一次 `repos/{nwo}.permissions.push`，在合并评论里**如实说明**
+  该批准是否计入 branch protection 的 required reviews（避免"以为有硬门禁其实没有"）
+
+**教训**：CLI 工具的"**全局配置切换**"与"**多进程并发**"在架构上互斥。
+凡是需要多身份的地方，一律走**每进程凭据**，不要走全局开关。

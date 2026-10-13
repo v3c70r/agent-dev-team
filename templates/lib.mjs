@@ -18,6 +18,10 @@ export function sh(cmd, opts = {}) {
     cwd: opts.cwd || ROOT,
     encoding: 'utf8',
     stdio: ['pipe', 'pipe', 'pipe'],
+    // env/timeout MUST be forwarded: dropping them silently broke per-role
+    // GitHub identities (reviewer GH_TOKEN) and long-running commands.
+    ...(opts.env ? { env: opts.env } : {}),
+    ...(opts.timeout ? { timeout: opts.timeout } : {}),
   });
   return out.trim();
 }

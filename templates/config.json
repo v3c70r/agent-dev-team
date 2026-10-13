@@ -9,5 +9,6 @@
   "reviewFallback": {
     "provider": "",
     "model": ""
-  }
+  },
+  "reviewerGhUser": ""
 }

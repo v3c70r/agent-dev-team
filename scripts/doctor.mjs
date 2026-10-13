@@ -266,6 +266,37 @@ const CHECKS = [
     },
   },
   {
+    name: 'reviewer 账号',
+    run() {
+      let cfg = {};
+      try { cfg = JSON.parse(readFileSync(path.join(ROOT, '.agent', 'config.json'), 'utf8')); } catch {}
+      const user = String(process.env.REVIEWER_GH_USER || cfg.reviewerGhUser || '').trim();
+      if (!user) {
+        return { status: 'warn',
+                 detail: '未配置 reviewerGhUser —— Agent B 的批准只能以评论记录（同账号无法 approve 自己的 PR）',
+                 fix: '另配一个 GitHub 账号并写入 .agent/config.json 的 reviewerGhUser' };
+      }
+      let token = '';
+      try { token = run(['gh', 'auth', 'token', '--user', user]).trim(); } catch {}
+      if (!token) {
+        return { status: 'fail', detail: `reviewerGhUser=${user} 但拿不到 token`,
+                 fix: `gh auth login 添加该账号，或检查 \`gh auth token --user ${user}\`` };
+      }
+      const env = { ...process.env, GH_TOKEN: token };
+      let login = '', push = '';
+      try { login = run(['gh', 'api', 'user', '--jq', '.login'], { env }).trim(); } catch {}
+      try {
+        const nwo = run(['gh', 'repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner']).trim();
+        push = run(['gh', 'api', `repos/${nwo}`, '--jq', '.permissions.push'], { env }).trim();
+      } catch {}
+      if (!login) return { status: 'fail', detail: `reviewerGhUser=${user} 的 token 不可用`, fix: '重新 gh auth login' };
+      const counts = push === 'true';
+      return { status: counts ? 'pass' : 'warn',
+               detail: `reviewer=${login}（${counts ? '有写权限 → 批准可计入 branch protection' : '只读 → 可提交批准/评论，但不计入 required reviews'}）`,
+               fix: counts ? null : '如需硬门禁：给该账号 write 权限' };
+    },
+  },
+  {
     name: 'labels',
     run() {
       let out;

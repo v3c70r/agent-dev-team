@@ -92,6 +92,39 @@ function reportGap(title, body) {
 }
 
 // ── tiny helpers ──
+// ── reviewer identity (optional separate GitHub account) ──
+// .agent/config.json: { "reviewerGhUser": "qgu-reviewer" }  (env REVIEWER_GH_USER wins)
+// Purpose: Agent B (and its批准 review) should act as a *different* account than
+// the implementer, so the approval is a genuine second identity instead of the
+// "cannot approve your own PR" workaround (docs/lessons.md #4).
+// NEVER use `gh auth switch` here: it rewrites the global gh config and races with
+// the other pipelines/sessions calling gh on the same machine (lesson #20).
+// Pass a per-process GH_TOKEN instead.
+const REVIEWER_GH_USER = String(process.env.REVIEWER_GH_USER || CFG_JSON.reviewerGhUser || '').trim();
+let _reviewerEnvCache;
+function reviewerEnv() {
+  if (!REVIEWER_GH_USER) return {};
+  if (_reviewerEnvCache !== undefined) return _reviewerEnvCache;
+  try {
+    const tok = sh(['gh', 'auth', 'token', '--user', REVIEWER_GH_USER]).trim();
+    _reviewerEnvCache = tok ? { ...process.env, GH_TOKEN: tok } : {};
+    if (!tok) console.warn(`[reviewer] ${REVIEWER_GH_USER} 无可用 token，回退到当前 gh 账号`);
+  } catch (e) {
+    console.warn(`[reviewer] 无法获取 ${REVIEWER_GH_USER} 的 token（${e.message}），回退到当前 gh 账号`);
+    _reviewerEnvCache = {};
+  }
+  return _reviewerEnvCache;
+}
+/** 该 reviewer 账号是否有写权限（决定其批准能否计入 branch protection 的 required reviews） */
+function reviewerCanCountApproval() {
+  if (!REVIEWER_GH_USER) return null;
+  try {
+    const nwo = ghJson(['repo', 'view', '--json', 'nameWithOwner']).nameWithOwner;
+    const out = sh(['gh', 'api', `repos/${nwo}`, '--jq', '.permissions.push'], { env: reviewerEnv() }).trim();
+    return out === 'true';
+  } catch { return null; }
+}
+
 function ghJson(args) { return JSON.parse(gh(args)); }
 function gh(args, opts = {}) {
   return sh(['gh', ...args], opts);
@@ -210,7 +243,7 @@ async function runReviewRound(issueNum, prNum) {
   const prompt = buildPrompt('reviewer', { issue: { number: issueNum }, pr: prNum });
   let out;
   try {
-    out = runPi(`agent-review-${prNum}`, prompt, null, REVIEW);
+    out = runPi(`agent-review-${prNum}`, prompt, null, REVIEW, reviewerEnv());
   } catch (err) {
     if (!isModelUnavailable(err)) throw err;
     const fallback = REVIEW_FALLBACK;
@@ -219,7 +252,7 @@ async function runReviewRound(issueNum, prNum) {
     log(issueNum, `B: 模型不可用（${describeModel(REVIEW)}）→ 回退到 ${describeModel(fallback)}`);
     try { commentOnPr(prNum, `⚠️ **审查模型不可用**（\`${describeModel(REVIEW)}\`）：\`${detail.replace(/\n/g, ' ')}\`\n\n已自动回退到 \`${describeModel(fallback)}\` 完成本轮审查（不影响合并）。\n长期方案：为账户充值，或设置 \`REVIEW_PROVIDER\`/\`REVIEW_MODEL\` 指向可用模型。`); } catch {}
     reportGap(`审查模型不可用（${describeModel(REVIEW)}）`, `## 现象\n审查轮次调用模型失败，错误被判定为额度/限流类。\n\n## 模型\n- 主: ${describeModel(REVIEW)}\n- 回退: ${describeModel(fallback)}\n\n## 错误\n\`\`\`\n${detail}\n\`\`\`\n\n## 建议\n模板已自动回退；可考虑在 doctor 中预检模型额度（\`pi auth check\` 不检测余额），或支持多模型候选列表。`);
-    out = runPi(`agent-review-${prNum}`, prompt, null, fallback);
+    out = runPi(`agent-review-${prNum}`, prompt, null, fallback, reviewerEnv());
   }
   const { verdict, source } = parseReviewVerdict(out);
   log(issueNum, `B: verdict=${verdict} (${source}, model=${describeModel(REVIEW)})`);
@@ -303,7 +336,7 @@ const IMPL = {
 };
 function describeModel(m) { return m.provider && m.model ? `${m.provider}/${m.model}` : '(pi default)'; }
 
-function runPi(sessionId, prompt, branchHint, model = {}) {
+function runPi(sessionId, prompt, branchHint, model = {}, extraEnv = {}) {
   const cwdNote = branchHint ? `当前分支应为 agent 分支（已在本地 checkout）。` : '';
   const extra = prompt; // full system prompt already assembled by buildPrompt
   mkdirSync(TMP, { recursive: true });
@@ -319,7 +352,8 @@ function runPi(sessionId, prompt, branchHint, model = {}) {
     '现在执行上面给出的完整任务：读所需上下文，用工具完成所有步骤，然后输出总结并结束。'];
   try {
     const bin = resolvePi();
-    return execFileSync(bin, args, { cwd: ROOT, encoding: 'utf8', timeout: 0, stdio: ['ignore', 'pipe', 'pipe'] });
+    return execFileSync(bin, args, { cwd: ROOT, encoding: 'utf8', timeout: 0, stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, ...extraEnv } });
   } catch (e) {
     // even on nonzero exit, capture stdout
     if (e.stdout) return e.stdout.toString();
@@ -513,12 +547,32 @@ async function finishMerge(issueNum, prNum) {
     try { commentOnIssue(issueNum, `🛑 合并前检测到 /reject，已**阻止自动合并** PR #${prNum}。该 PR 保持开放，等待人工处理。`); } catch {}
     return { skipped: 'rejected' };
   }
-  // GitHub forbids approving your own PR. If A/B share one account,
-  // record B's approval as a comment instead of a formal review.
-  try {
-    gh(['pr', 'review', String(prNum), '--approve', '--body', '🤖 Agent B 已批准 + Agent C 测试通过']);
-  } catch (e) {
-    commentOnPr(prNum, '🤖 Agent B 已批准（同一 GitHub 账号无法提交正式 approve review，以本评论作为批准记录）+ Agent C 测试通过。');
+  // ── 批准：优先用独立 reviewer 账号提交**真实** approve review ──
+  // （同一账号无法批准自己的 PR —— lessons #4；因此推荐配置第二个账号）
+  const approveBody = `🤖 Agent B 已批准 + Agent C 测试通过${REVIEWER_GH_USER ? `（批准账号：${REVIEWER_GH_USER}）` : ''}`;
+  let approvalNote = '';
+  if (REVIEWER_GH_USER) {
+    try {
+      gh(['pr', 'review', String(prNum), '--approve', '--body', approveBody], { env: reviewerEnv() });
+      const counts = reviewerCanCountApproval();
+      approvalNote = counts === true
+        ? `批准由独立账号 **${REVIEWER_GH_USER}** 提交（该账号有写权限，可计入分支保护的 required reviews）。`
+        : counts === false
+          ? `批准由独立账号 **${REVIEWER_GH_USER}** 提交 —— 但该账号只有只读权限，**此批准不会计入分支保护的 required reviews**（需要硬门禁请给它 write 权限）。`
+          : `批准由独立账号 **${REVIEWER_GH_USER}** 提交。`;
+    } catch (e) {
+      console.warn('[reviewer] 独立账号批准失败，回退到当前账号：' + e.message);
+      log(issueNum, `B: 独立账号 ${REVIEWER_GH_USER} 批准失败（${e.message}），回退`);
+    }
+  }
+  if (!approvalNote) {
+    try {
+      gh(['pr', 'review', String(prNum), '--approve', '--body', approveBody]);
+      approvalNote = '批准由当前 gh 账号提交。';
+    } catch (e) {
+      commentOnPr(prNum, '🤖 Agent B 已批准（当前账号无法提交正式 approve review —— 通常因为它是该 PR 的作者；以本评论作为批准记录）+ Agent C 测试通过。');
+      approvalNote = '当前账号与 PR 作者相同，批准以**评论**记录（建议配置独立 reviewer 账号，见 SKILL.md）。';
+    }
   }
   try {
     gh(['pr', 'merge', String(prNum), '--squash', '--delete-branch']);
@@ -535,7 +589,7 @@ async function finishMerge(issueNum, prNum) {
   if (!s[issueNum]) s[issueNum] = {};
   s[issueNum].status = 'merged';
   state.save(s);
-  commentOnIssue(issueNum, `🎉 已合并 (PR #${prNum})。issue 将被自动关闭。`);
+  commentOnIssue(issueNum, `🎉 已合并 (PR #${prNum})。issue 将被自动关闭。\n\n${approvalNote}`);
   log(issueNum, '状态: merged');
   return { merged: true };
 }

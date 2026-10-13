@@ -156,7 +156,28 @@ gh workflow run issue-agent.yml
 - **每周自动批准上限** `AUTO_APPROVE_WEEKLY_CAP`（默认 10）；超额则回退为"等你 `/approve`"
 - `/reject` 随时可撤销批准（会撤回并停止实现）
 
-### 2) 依赖声明 `Depends on: #N` —— 批量建 issue 也不会乱序
+### 2) 两个 GitHub 账号（推荐：开发者 + 审查者）
+
+GitHub 不允许批准自己创建的 PR，所以单账号时 Agent B 的"批准"只能降级为一条评论。
+本机配置第二个账号即可获得**真实 approve review**（独立身份、可审计、能计入分支保护）：
+
+```bash
+gh auth login                      # 账号 1：开发者（推送/开 PR/合并）
+gh auth login                      # 账号 2：审查者
+# 然后在 .agent/config.json 写：  "reviewerGhUser": "<审查者账号>"
+```
+
+效果：Agent B 的 pi 会话与提交 approve 都用该账号的 `GH_TOKEN`；Agent A/PM/筛选仍用当前账号。
+成功后合并评论会写明批准账号，并说明该账号的权限是否足以计入 branch protection。
+
+> ⚠️ **绝对不要用 `gh auth switch`**：它会改写全局 `~/.config/gh/hosts.yml`，
+> 而同一台机器上有多个流水线会话在并发调用 `gh`（watcher 每 30 秒轮询、PM/筛选、探针），
+> 切换瞬间其它进程可能用错身份（推送失败、关 issue 失败）。一律用**每进程 `GH_TOKEN`**（本工具已内置）。
+
+建议权限：审查者给 **read** 即可提交评论/批准；若想让批准**计入**分支保护的
+required reviews（硬门禁），需要给它 **write**（否则 GitHub 不把该批准计入）。
+
+### 3) 依赖声明 `Depends on: #N` —— 批量建 issue 也不会乱序
 
 issue 正文里写一行（任一写法均可）：
 

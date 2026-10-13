@@ -15,5 +15,6 @@
     "model": "deepseek-v4-flash"
   },
   "screenAutoApprove": true,
-  "screenAutoCapWeekly": 5
+  "screenAutoCapWeekly": 5,
+  "reviewerGhUser": "qgu-reviewer"
 }
