@@ -156,7 +156,11 @@ gh workflow run issue-agent.yml
 - **每周自动批准上限** `AUTO_APPROVE_WEEKLY_CAP`（默认 10）；超额则回退为"等你 `/approve`"
 - `/reject` 随时可撤销批准（会撤回并停止实现）
 
-### 2) 两个 GitHub 账号（推荐：开发者 + 审查者）
+### 2) 两个 GitHub 账号（**可选**：开发者 + 审查者）
+
+> **默认就是单账号模式**，完全可用：Agent B 的批准会以 PR 评论记录
+> （GitHub 不允许批准自己创建的 PR）。只有在你想让批准成为**独立身份的正式 review**
+> （或让 branch protection 的 required reviews 真正生效）时，才需要下面的配置。
 
 GitHub 不允许批准自己创建的 PR，所以单账号时 Agent B 的"批准"只能降级为一条评论。
 本机配置第二个账号即可获得**真实 approve review**（独立身份、可审计、能计入分支保护）：

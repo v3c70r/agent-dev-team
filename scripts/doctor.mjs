@@ -272,9 +272,9 @@ const CHECKS = [
       try { cfg = JSON.parse(readFileSync(path.join(ROOT, '.agent', 'config.json'), 'utf8')); } catch {}
       const user = String(process.env.REVIEWER_GH_USER || cfg.reviewerGhUser || '').trim();
       if (!user) {
-        return { status: 'warn',
-                 detail: '未配置 reviewerGhUser —— Agent B 的批准只能以评论记录（同账号无法 approve 自己的 PR）',
-                 fix: '另配一个 GitHub 账号并写入 .agent/config.json 的 reviewerGhUser' };
+        return { status: 'pass',
+                 detail: '单账号模式（未配置 reviewerGhUser）：Agent B 的批准以 PR 评论记录 —— GitHub 不允许批准自己的 PR，属预期行为。想要真实 approve review 可另配账号填入 reviewerGhUser',
+                 fix: null };
       }
       let token = '';
       try { token = run(['gh', 'auth', 'token', '--user', user]).trim(); } catch {}

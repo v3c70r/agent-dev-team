@@ -9,12 +9,12 @@
     "provider": "deepseek",
     "model": "deepseek-v4-flash"
   },
-  "notes": "review = zai-coding-cn (智谱 CN lite coding plan)；reviewFallback = deepseek-flash；screener = deepseek-flash",
+  "notes": "单账号模式（v3c70r 兼做实现与审查）：reviewerGhUser 留空 → 同账号无法 approve 自己的 PR，批准以 PR 评论记录（行为与改造前一致）。如需真实 approve，可另配账号并填入此处。",
   "screener": {
     "provider": "deepseek",
     "model": "deepseek-v4-flash"
   },
   "screenAutoApprove": true,
   "screenAutoCapWeekly": 5,
-  "reviewerGhUser": "qgu-reviewer"
+  "reviewerGhUser": ""
 }
