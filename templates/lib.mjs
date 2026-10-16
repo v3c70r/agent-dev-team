@@ -78,7 +78,7 @@ export function selectPendingIssues(issues = [], state = {}) {
 // origin/<base>` would silently RESET it back to base (dropping the previous
 // round's commits) and turn the follow-up `git push` into a non-fast-forward
 // reject. This is the single, testable place where that decision is made
-// (lesson #18). `fetch origin` (all refs) is required so `origin/<branch>`
+// (lesson #19). `fetch origin` (all refs) is required so `origin/<branch>`
 // is up to date on the fix-round path.
 export function prepareImplementerBranch({ branch, base, cwd } = {}) {
   const exists = (ref) => {
@@ -100,9 +100,34 @@ export function prepareImplementerBranch({ branch, base, cwd } = {}) {
 
 // State updates must MERGE, never replace: overwriting an issue entry with a
 // fresh `{round:0,fixes:0}` erased the review round the loop had just recorded,
-// so state.json could not remember that any fix round happened (lesson #18).
+// so state.json could not remember that any fix round happened (lesson #19).
 export function mergeIssueState(prev, patch) {
   return { ...(prev || {}), ...patch };
+}
+
+// ── 不可逆动作的「真实状态」判定（issue #16）────────────────────────
+// `gh pr merge --delete-branch` 的语义是「先合并，再删本地与远程分支」：
+// 删本地分支需要「当前分支」，工作区 detached HEAD 时 gh 抛
+// `could not determine current branch: ... not on any branch` —— **合并在前、
+// 报错在后**。所以退出码不能当作合并结果的事实来源：不可逆动作只认「读回
+// 的真实状态」（issue #14/PR #15 的真实事故：mergedAt=17:23:32Z 已合并，
+// 日志 17:23:34 却写 needs_human）。
+// 三个终值：
+//   merged  → 已合并（退出码非零也不例外）
+//   blocked → 确认未合并（PR 仍 OPEN/CLOSED）
+//   unknown → 读不到状态 → fail-closed（按未合并处理，交人工确认）
+// 纯函数、无副作用，pipeline 与 validate 共用同一判定（避免两份逻辑漂移）。
+export const MERGE_MERGED = 'merged';
+export const MERGE_BLOCKED = 'blocked';
+export const MERGE_UNKNOWN = 'unknown';
+// `error` 是 `gh pr merge` 的报错文本（保留用于调用点可读性 / 未来诊断），
+// 判定本身**只**依赖读回的 `pr` —— 这正是本函数存在的意义：
+// 命令报错但已合并仍应判 merged。
+export function classifyMergeAttempt({ error, pr } = {}) {
+  const merged = !!(pr && (pr.state === 'MERGED' || pr.mergedAt));
+  if (merged) return MERGE_MERGED;
+  if (pr && (pr.state === 'OPEN' || pr.state === 'CLOSED')) return MERGE_BLOCKED;
+  return MERGE_UNKNOWN;
 }
 
 // default branch auto-detected (main/master); override with AGENT_BASE.

@@ -31,7 +31,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, copyFileSync, symlinkSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { detectBase, isRejectedIssue, mergeIssueState, prepareImplementerBranch, resolvePi, resolveTesterCommands, selectPendingIssues, sh } from './lib.mjs';
+import { classifyMergeAttempt, detectBase, isRejectedIssue, MERGE_BLOCKED, MERGE_MERGED, mergeIssueState, prepareImplementerBranch, resolvePi, resolveTesterCommands, selectPendingIssues, sh } from './lib.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const AGENT = path.join(ROOT, '.agent');
@@ -98,7 +98,7 @@ function reportGap(title, body) {
 // the implementer, so the approval is a genuine second identity instead of the
 // "cannot approve your own PR" workaround (docs/lessons.md #4).
 // NEVER use `gh auth switch` here: it rewrites the global gh config and races with
-// the other pipelines/sessions calling gh on the same machine (lesson #20).
+// the other pipelines/sessions calling gh on the same machine (lesson #23).
 // Pass a per-process GH_TOKEN instead.
 const REVIEWER_GH_USER = String(process.env.REVIEWER_GH_USER || CFG_JSON.reviewerGhUser || '').trim();
 let _reviewerEnvCache;
@@ -172,7 +172,7 @@ async function runImplementer(issue, roundNote = '') {
   const prompt = buildPrompt('implementer', { issue, branch, roundNote });
   // Fix rounds MUST continue on the PR's existing branch; only the first round
   // branches off base. `git checkout -B` on an existing branch would reset it
-  // back to base (lesson #18), so branch prep lives in a tested helper.
+  // back to base (lesson #19), so branch prep lives in a tested helper.
   const { reused } = prepareImplementerBranch({ branch, base: BASE });
   log(issue.number, `A: 开始实现 (branch=${branch}, ${reused ? `修复轮：基于 PR 现有分支 origin/${branch}` : `首轮：基于 origin/${BASE}`}, model=${describeModel(IMPL)}) ${roundNote ? '——' + roundNote : ''}`);
   const out = runPi(`agent-issue-${issue.number}`, prompt, branch, IMPL);
@@ -394,7 +394,7 @@ async function processIssueInner(issue, force = false) {
   // /reject 是硬性否决（issue #14）：标签驱动的取活只加否定标签不等于取消，
   // 必须把 agent-rejected 当作硬排除，并在实现/合并前落成终态 `rejected`。
   // 边界：若实现已在运行，本函数不会中断正在跑的 pi 会话（不在本 PR 范围），
-  // 但下一轮不再接管，PR 也不会被自动合并（见 docs/lessons.md #19）。
+  // 但下一轮不再接管，PR 也不会被自动合并（见 docs/lessons.md #20）。
   if (isRejectedIssue(issue) && !force) {
     s[issue.number] = mergeIssueState(s[issue.number], { status: 'rejected', title: issue.title });
     state.save(s);
@@ -574,24 +574,82 @@ async function finishMerge(issueNum, prNum) {
       approvalNote = '当前账号与 PR 作者相同，批准以**评论**记录（建议配置独立 reviewer 账号，见 SKILL.md）。';
     }
   }
+  // ── 合并前：detached HEAD 兜底 ──
+  // `gh pr merge --delete-branch` = 先合并、再删本地与远程分支；删本地分支需要
+  // 「当前分支」，detached HEAD 时会抛 `not on any branch`（**合并在前、报错在后**）。
+  // 先切回 BASE 让收尾步骤有分支可用（best-effort：失败仅 warn，不影响合并本身）。
+  try {
+    const cur = sh(['git', 'rev-parse', '--abbrev-ref', 'HEAD']);
+    if (cur === 'HEAD') {
+      try { sh(['git', 'checkout', BASE]); }
+      catch (e) {
+        console.warn('checkout BASE before merge failed (continuing):', e.message);
+        log(issueNum, `合并前切回 ${BASE} 失败（${e.message}），继续尝试合并`);
+      }
+    }
+  } catch (e) { console.warn('detached-HEAD probe failed (continuing):', e.message); }
+
+  // ── 合并：无论退出码如何，都不把它当作结果 ──
+  let mergeErr = null;
   try {
     gh(['pr', 'merge', String(prNum), '--squash', '--delete-branch']);
   } catch (e) {
-    console.warn('merge failed:', e.message);
-    commentOnIssue(issueNum, `❌ 自动合并失败（可能受分支保护限制）：${e.message}. 请手动合并 PR #${prNum}。`);
-    const sf = state.load();
-    sf[issueNum].status = 'needs_human';
-    state.save(sf);
-    log(issueNum, '状态: needs_human (merge blocked)');
-    return { skipped: 'needs_human' };
+    mergeErr = e;
+    console.warn('merge command failed (will verify real state):', e.message);
   }
-  const s = state.load();
-  if (!s[issueNum]) s[issueNum] = {};
-  s[issueNum].status = 'merged';
-  state.save(s);
-  commentOnIssue(issueNum, `🎉 已合并 (PR #${prNum})。issue 将被自动关闭。\n\n${approvalNote}`);
-  log(issueNum, '状态: merged');
-  return { merged: true };
+
+  // ── 读回 PR 的真实状态（不可逆动作只认读回状态，issue #16）──
+  // 读回失败 → pr 传 null → classifyMergeAttempt 判 unknown（fail-closed）。
+  let prState = null;
+  try {
+    prState = ghJson(['pr', 'view', String(prNum), '--json', 'state,mergedAt,headRefName']);
+  } catch (e) {
+    console.warn('pr view readback failed:', e.message);
+    prState = null;
+  }
+  const outcome = classifyMergeAttempt({ error: mergeErr?.message, pr: prState });
+
+  if (outcome === MERGE_MERGED) {
+    // 已合并（即便上面 gh 报了错）。尽力清理 `--delete-branch` 漏删的远程分支：
+    // 仅 warn，绝不因此改变合并结果。
+    const headBranch = prState?.headRefName;
+    if (headBranch) {
+      try {
+        if (sh(['git', 'ls-remote', '--heads', 'origin', headBranch])) {
+          try {
+            gh(['api', '-X', 'DELETE', `repos/{owner}/{repo}/git/refs/heads/${headBranch}`]);
+            log(issueNum, `已清理残留远程分支 ${headBranch}`);
+          } catch (e) {
+            console.warn('remote branch cleanup failed:', e.message);
+            log(issueNum, `远程分支 ${headBranch} 清理失败（${e.message}）—— 不影响合并结果`);
+          }
+        }
+      } catch (e) { console.warn('ls-remote failed:', e.message); }
+    }
+    const s = state.load();
+    s[issueNum] = mergeIssueState(s[issueNum], { status: 'merged' });
+    state.save(s);
+    const errNote = mergeErr
+      ? `\n\n> ⚠️ \`gh pr merge\` 退出码非零（\`${mergeErr.message}\`），但读回 PR 状态确认已合并 —— **以真实状态为准**。`
+      : '';
+    commentOnIssue(issueNum, `🎉 已合并 (PR #${prNum})。issue 将被自动关闭。\n\n${approvalNote}${errNote}`);
+    log(issueNum, `状态: merged${mergeErr ? '（尽管 gh pr merge 报错，读回状态为已合并）' : ''}`);
+    return { merged: true };
+  }
+
+  const sf = state.load();
+  sf[issueNum] = mergeIssueState(sf[issueNum], { status: 'needs_human' });
+  state.save(sf);
+  if (outcome === MERGE_BLOCKED) {
+    // 确认未合并：保留原错误文案，但明确「读回确认未合并」
+    commentOnIssue(issueNum, `❌ 自动合并失败（读回状态确认 PR #${prNum} **未合并**${mergeErr ? `：${mergeErr.message}` : ''}，可能受分支保护限制）。请手动合并 PR #${prNum}。`);
+    log(issueNum, '状态: needs_human (merge blocked)');
+  } else {
+    // unknown：读不到真实状态 → fail-closed，交人工确认（不再假装“已知失败”）
+    commentOnIssue(issueNum, `⚠️ 无法确认 PR #${prNum} 的合并结果，已按未合并处理，请人工确认${mergeErr ? `（\`gh pr merge\` 报错：${mergeErr.message}）` : ''}。`);
+    log(issueNum, '状态: needs_human (merge result unknown)');
+  }
+  return { skipped: 'needs_human' };
 }
 
 // ── CLI ──
