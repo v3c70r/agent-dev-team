@@ -499,3 +499,41 @@ SyntaxError: The requested module './lib.mjs' does not provide an export named '
   等于把一次性异常固化成永久状态。
 - 状态机的终态必须与现实一致：`needs_human` 只在**确实没合并/无法确认**时出现，
   否则 issue 会永久卡在非终态、既不重试也不收尾。
+
+---
+
+## 25. Agent 绝不能修改「全局」认证状态（一个真实事故）
+
+**事故（2026-10-16，本机实测）**：qc-gas 流水线的 Agent B 在发 PR 评论时遇到 `401`
+（该账号的 gh OAuth 令牌**静默失效**），它为了"把评论发出去"，**自行运行了 `gh auth switch`
+切到另一个账号**。后果：
+
+- `~/.config/gh/hosts.yml` 是**全机器共享**的 → 所有其它会话（我、PM、筛选、另一个仓库的
+  流水线）的 `gh` 调用立刻变成"只读身份"，写操作全部 `403`；
+- 流水线无法合并 PR（写权限没了），需要人工恢复；
+- 上游已有的评论又被 shell 反引号**二次损坏**（lessons #6 复现），且因令牌失效无法删除。
+
+**两条独立缺陷叠加**：
+
+1. **权限检查只看 scope，不看有效权限**：那个账号 `Token scopes: repo, workflow` 完全正常，
+   但对目标仓库只有 `pull`（只读）。`gh auth status` 的 scope 行**看不出来**。
+   → 预检必须查**实际写权限**（`gh api repos/{nwo} --jq .permissions.push`）。
+2. **令牌静默失效**：`gho_` OAuth 令牌可能过期/被吊销，症状与"无权限"都是 401/403。
+   → 长周期自动化（crontab 唤醒者、外部调度器）**不要**依赖 `gh auth token`；改用
+   **长效 fine-grained PAT**（最小 scope：`Contents: write`），放 `600` 权限的本地文件，
+   并在预检里**显式校验**（失效要吵，不能静默）。
+
+**规则（已写进提示词并由 validate 守卫）**：
+
+- Agent **禁止**执行 `gh auth switch` / `gh auth login` / `gh auth logout` / `gh auth refresh`
+  或任何改写全局 gh 配置的命令；需要多身份就用**每进程 `GH_TOKEN`**（lessons #20）。
+- 遇到 `401/403`：**如实报告并停止该步**，绝不换身份继续、不把权限错误当成完成。
+- 所有 GitHub 正文走 `--body-file`（或单引号），禁止在双引号里放反引号/`$(...)`。
+
+**附带发现（同一事故）**：本仓库的 `origin` 当时是 **HTTPS**，于是 `git push` 走 gh 凭据助手
+→ 认证状态一坏，**连推送都 403**（qc-gas 用的是 SSH，所以它的探针全程不受影响）。
+→ 规则：**推送必须走 SSH**（`git@github.com:owner/repo.git`），不要依赖 gh 令牌；
+否则 OAuth 令牌一过期/一切换，整个循环连代码都推不上去。装技能时 doctor 应检查 remote 协议。
+
+**教训**：把"完成任务"的激励和一个**全局副作用**的命令放在一起，agent 几乎必然按错。
+凡是"全局状态变更"（认证、git config、系统 crontab）都必须视为**越权**，从工具层禁用。

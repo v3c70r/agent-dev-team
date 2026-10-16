@@ -121,8 +121,37 @@ const CHECKS = [
       const scopeMatch = out.match(/Token scopes:\s*([^\n]*)/i);
       const scopes = scopeMatch ? [...scopeMatch[1].matchAll(/'([^']+)'/g)].map(m => m[1]) : [];
       const missing = ['repo', 'workflow'].filter(s => !scopes.includes(s));
-      if (missing.length === 0) return { status: 'pass', detail: `已登录 ${account}；scopes: ${scopes.join(', ')}` };
-      return { status: 'warn', detail: `已登录 ${account}，但缺 scopes: ${missing.join(', ')}`, fix: '运行 `gh auth refresh -s repo,workflow`' };
+
+      // ── 有效身份 + **写权限**檢查（lessons #21）──
+      // `Token scopes: repo` ≠ 对该仓库有写权限：2026-10-16 实测活动账号是一个只读
+      // 协作者（scopes 完全正常），于是所有 gh 写操作 403、流水线卡在合并——上面的
+      // scope 检查看不出来。而「令牌已失效」在这里也长得一模一样（都是 401）。
+      let login = '';
+      try { login = run(['gh', 'api', 'user', '--jq', '.login']).trim(); }
+      catch (e) {
+        const b = String(e.message || e).replace(/\s+/g, ' ').slice(0, 120);
+        return { status: 'fail', detail: `活动账号 ${account} 的 token 不可用（${b}）`,
+                 fix: '令牌可能已失效：`gh auth login -h github.com --web` 重新登录（多账号时选对账号）；生产触发链建议改用长效 PAT（lessons #21）' };
+      }
+      const cfg = loadConfig();
+      const expect = String(process.env.EXPECTED_GH_USER || cfg.expectedGhUser || '').trim();
+      let push = null;
+      try {
+        const nwo = JSON.parse(run(['gh', 'repo', 'view', '--json', 'nameWithOwner'])).nameWithOwner;
+        push = run(['gh', 'api', `repos/${nwo}`, '--jq', '.permissions.push']).trim() === 'true';
+      } catch { /* 非 GitHub 仓库 / 网络问题：不阻断，后续按 scopes 与身份给结论 */ }
+      if (push === false) {
+        return { status: 'fail', detail: `活动账号 ${login} 对该仓库无写权限（scope 有、权限没有）`,
+                 fix: `切到有写权限的账号：\`gh auth switch --user ${expect || '<owner>'}\`（仅限人工操作）；流水线内更稳的是给每个进程注入 GH_TOKEN（lessons #20/#21）` };
+      }
+      if (missing.length) {
+        return { status: 'warn', detail: `已登录 ${login}，但缺 scopes: ${missing.join(', ')}`, fix: '运行 `gh auth refresh -s repo,workflow`' };
+      }
+      if (expect && login !== expect) {
+        return { status: 'warn', detail: `活动账号 ${login} ≠ 期望账号 ${expect}（有写权限，但身份不同）`,
+                 fix: `若非有意：\`gh auth switch --user ${expect}\`` };
+      }
+      return { status: 'pass', detail: `已登录 ${login}；scopes: ${scopes.join(', ')}；仓库写权限 ✓` };
     },
   },
   {

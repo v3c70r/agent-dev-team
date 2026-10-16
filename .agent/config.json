@@ -16,5 +16,6 @@
   },
   "screenAutoApprove": true,
   "screenAutoCapWeekly": 5,
-  "reviewerGhUser": ""
+  "reviewerGhUser": "",
+  "expectedGhUser": ""
 }

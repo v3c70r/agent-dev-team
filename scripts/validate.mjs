@@ -79,6 +79,17 @@ for (const [t, live] of PAIRS) {
   const r = readFileSync(path.join(ROOT, 'templates/prompts/reviewer.md'), 'utf8');
   if (!r.includes('RESULT: APPROVE')) fail('reviewer prompt lost the machine-readable verdict rule');
   else ok('reviewer verdict sentinel present');
+  // 7b) both prompts must keep the global-auth ban + --body-file rule.
+  // Lessons #21: an agent ran `gh auth switch` mid-run, which changed the
+  // MACHINE-WIDE gh identity and broke every other session's write access
+  // (403s) plus the loop's merge. Lessons #6: comment bodies mangled by shell
+  // expansion. Both are prompt-level rules, so guard them in code.
+  for (const f of ['templates/prompts/reviewer.md', 'templates/prompts/implementer.md']) {
+    const t = readFileSync(path.join(ROOT, f), 'utf8');
+    if (!t.includes('禁止修改全局认证状态')) fail(`${f} lost the global-auth-mutation ban (lessons #21)`);
+    if (!t.includes('--body-file')) fail(`${f} lost the --body-file rule (lessons #6)`);
+  }
+  ok('prompt guards: global-auth ban + --body-file present');
 }
 
 // 8. doctor dogfood self-check: `npm run doctor` must be green in THIS repo
