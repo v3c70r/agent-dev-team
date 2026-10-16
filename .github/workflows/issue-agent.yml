@@ -45,7 +45,7 @@ jobs:
                 });
               } catch (e) { core.warning('add label ' + name + ': ' + e.message); }
             }
-            // 取消批准必须真正移除触发标签：只加否定标签 ≠ 取消（见 docs/lessons.md #19）
+            // 取消批准必须真正移除触发标签：只加否定标签 ≠ 取消（见 docs/lessons.md #20）
             async function removeLabels(issue, names) {
               for (const name of names) {
                 try {

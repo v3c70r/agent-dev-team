@@ -201,7 +201,7 @@ let doctorHumanOut = '';
   } finally { rmSync(tmp, { recursive: true, force: true }); }
 }
 
-// 13. Agent A 的修复轮必须基于 PR 现有分支（lesson #18）
+// 13. Agent A 的修复轮必须基于 PR 现有分支（lesson #19）
 //     `git checkout -B <branch> origin/<base>` 会把已存在的分支静默重置回 base，
 //     丢掉上一轮实现并让 push 被非快进拒绝。用临时 bare origin + clone 做真集成断言
 //     （无网络、无 gh、无 pi 依赖）。
@@ -331,6 +331,72 @@ let doctorHumanOut = '';
     if (/labels\.includes\(REJECTED\)/.test(approveBlock)) ok(`${wfPath}: approve 分支处理存量双标签（可重新批准）`);
     else fail(`${wfPath}: approve 分支在存量双标签（agent-approved+agent-rejected）issue 上是 no-op`);
   }
+}
+
+// 15. 不可逆动作只认「读回的真实状态」（issue #16）
+//     真实事故：#14 的 `gh pr merge 15 --squash --delete-branch` 在 detached HEAD
+//     下报 `could not determine current branch: ... not on any branch` —— 但合并
+//     **已经成功**（mergedAt=17:23:32Z，早于那条报错日志 2 秒）。旧代码把退出码
+//     当结果来源 → 误置 needs_human、留言「请手动合并」、远程分支 `agent/14` 残留，
+//     状态机因此永久背离现实。修复=读回 PR 真实状态后再判定，读不到则 fail-closed。
+{
+  // 15a. 纯函数 classifyMergeAttempt：退出码非零但已合并 → 仍是 merged
+  if (typeof lib.classifyMergeAttempt !== 'function') {
+    fail('templates/lib.mjs 缺少 classifyMergeAttempt()');
+  } else {
+    const cases = [
+      ['已合并（无错误）', { pr: { state: 'MERGED' } }, lib.MERGE_MERGED],
+      ['命令报错但已合并（核心回归：#14 真实错误串）',
+        { error: 'could not determine current branch: failed to run git: not on any branch',
+          pr: { state: 'MERGED', mergedAt: '2026-10-11T17:23:32Z' } }, lib.MERGE_MERGED],
+      ['仅凭 mergedAt 也判已合并', { pr: { mergedAt: '2026-10-11T17:23:32Z' } }, lib.MERGE_MERGED],
+      ['确认未合并 OPEN', { error: 'x', pr: { state: 'OPEN' } }, lib.MERGE_BLOCKED],
+      ['确认未合并 CLOSED', { error: 'x', pr: { state: 'CLOSED' } }, lib.MERGE_BLOCKED],
+      ['读不到状态 → fail-closed', { error: 'x', pr: null }, lib.MERGE_UNKNOWN],
+      ['无参数 → fail-closed', {}, lib.MERGE_UNKNOWN],
+    ];
+    const problems = [];
+    for (const [label, args, expect] of cases) {
+      let got;
+      try { got = lib.classifyMergeAttempt(args); }
+      catch (e) { problems.push(`${label} 抛错: ${e.message}`); continue; }
+      if (got !== expect) problems.push(`${label}: 期望 ${expect} 实得 ${got}`);
+    }
+    problems.length
+      ? fail(`classifyMergeAttempt: ${problems.join('; ')}`)
+      : ok('classifyMergeAttempt: 命令报错但 PR 已合并仍判 merged（以读回状态为准）');
+  }
+
+  // 15b. finishMerge()：读回 PR 状态必须先于写 needs_human（禁止以退出码为准）
+  const pipe = readFileSync(path.join(ROOT, 'templates/pipeline.mjs'), 'utf8');
+  const fm = pipe.split('async function finishMerge(')[1]?.split('\n}')[0] || '';
+  const iMerge = fm.indexOf("'merge'");          // gh pr merge 调用点
+  const iRead = fm.indexOf("'pr', 'view'");      // gh pr view 读回（区分开头的 gh issue view）
+  const iClassify = fm.indexOf('classifyMergeAttempt(');
+  // lastIndexOf：finishMerge 顶部「无法确认 /reject 标签」的 needs_human 路径也合法存在，
+  // 这里要断言的是**合并失败路径**的 needs_human 不在读回之前（否则仍是退出码即结果）。
+  const iNeedsHuman = fm.lastIndexOf("'needs_human'");
+  if (iMerge === -1) fail('finishMerge() 未找到 gh pr merge 调用');
+  else if (iRead === -1 || iRead < iMerge) fail('finishMerge() 必须在 gh pr merge 之后用 `gh pr view` 读回真实状态（禁止只看退出码）');
+  else if (iClassify === -1 || iClassify < iMerge) fail('finishMerge() 必须用 classifyMergeAttempt() 判定读回结果（且位于 gh pr merge 之后）');
+  else if (iNeedsHuman === -1 || iNeedsHuman < iClassify) fail("finishMerge() 写 needs_human 的代码必须位于读回+判定之后（否则仍会以退出码为准误判合并失败）");
+  else ok('finishMerge(): gh pr merge 后读回 PR 状态 + classifyMergeAttempt 分流，needs_human 只在读回之后写入');
+  // detached HEAD 兜底：合并前切回 BASE，让 `--delete-branch` 的本地收尾有分支可用
+  if (/'rev-parse'[\s\S]{0,90}'HEAD'/.test(fm) && /'checkout'[\s\S]{0,40}BASE/.test(fm)) ok('finishMerge() 在合并前处理 detached HEAD（切回 BASE，best-effort）');
+  else fail('finishMerge() 未在合并前检测 detached HEAD 并切回 BASE（`--delete-branch` 会抛 not on any branch）');
+  // 合并成功后尽力清理残留远程分支（读回 headRefName → ls-remote → api DELETE，失败只 warn）
+  if (/ls-remote/.test(fm) && /git\/refs\/heads/.test(fm)) ok('finishMerge() 合并成功后尽力清理残留远程分支（失败不改变结果）');
+  else fail('finishMerge() 未在合并成功后尽力清理残留远程分支（如 agent/14 会无限累积）');
+  if (/repos\/\{owner\}\/\{repo\}/.test(fm) || /'api'[\s\S]{0,40}'DELETE'/.test(fm)) ok('finishMerge() 用 gh api DELETE 删远程分支');
+  else fail('finishMerge() 未用 gh api DELETE 删远程分支');
+
+  // 15c. docs/lessons.md 条目编号唯一（现存重复 17/18/19 → 文档纪律退化）
+  const lessons = readFileSync(path.join(ROOT, 'docs/lessons.md'), 'utf8');
+  const nums = [...lessons.matchAll(/^## (\d+)\./gm)].map(m => Number(m[1]));
+  const seen = new Set(); const dups = [];
+  for (const n of nums) { if (seen.has(n)) dups.push(n); seen.add(n); }
+  if (dups.length) fail(`docs/lessons.md 条目编号重复: ${dups.join(', ')}`);
+  else ok(`docs/lessons.md 条目编号唯一（共 ${nums.length} 条）`);
 }
 
 

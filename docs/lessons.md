@@ -253,7 +253,7 @@ Agent C 实际执行的只是 `npm run build` + `npm test`。
 
 ---
 
-## 17. 「审计记忆」写在别人的文件里 + 只靠自觉读取 = 形同没有
+## 18. 「审计记忆」写在别人的文件里 + 只靠自觉读取 = 形同没有
 
 **现象**：筛选器把拒绝理由追加到 `docs/product-review.md`（PM 的长期记忆），
 但该文件的 owner 是 PM，且 PM 被明确要求"保持 ≤180 行、删除过时内容"。
@@ -279,7 +279,7 @@ PM 下次既不知道"该怎么小范围重提"，也分不清"不许再提"与"
 
 ---
 
-## 18. 修复轮把分支重置回 base，且状态计数器被覆盖
+## 19. 修复轮把分支重置回 base，且状态计数器被覆盖
 
 **现象**：Agent A 的**修复轮**（Agent B `REQUEST_CHANGES` 之后、Agent C 测试失败之后）
 会把 agent 分支重置回 base，而不是基于 PR 现有分支继续提交。临时仓库实测：
@@ -317,7 +317,7 @@ PM 下次既不知道"该怎么小范围重提"，也分不清"不许再提"与"
 
 ---
 
-## 19. 「取消」必须移除触发标签：只加否定标签 ≠ 取消
+## 20. 「取消」必须移除触发标签：只加否定标签 ≠ 取消
 
 **现象**：产品承诺 `/reject` 可以**取消**一次批准（README、SKILL、Actions 批准评论都这么写），
 但实测否决**不生效**——尤其是**筛选器自动批准**之后（`screenAutoApprove` 默认开启，
@@ -374,7 +374,7 @@ PM 下次既不知道"该怎么小范围重提"，也分不清"不许再提"与"
 
 ---
 
-## 18. 改了 workflow 内联脚本调用的 helper，却忘了它已被重命名 → **所有 triage 全部失败**
+## 21. 改了 workflow 内联脚本调用的 helper，却忘了它已被重命名 → **所有 triage 全部失败**
 
 **现象**：给 triage 增加 `auto-approve` 标签支持后，新 issue **完全没有被打标签**——
 既没有 `agent-seen`，也没有自动批准。查 Actions 日志：
@@ -401,7 +401,7 @@ ReferenceError: ensureLabel is not defined
 
 ---
 
-## 19. 升级时只复制了一半（pipeline.mjs 而没复制 lib.mjs）→ watcher 崩溃重启循环
+## 22. 升级时只复制了一半（pipeline.mjs 而没复制 lib.mjs）→ watcher 崩溃重启循环
 
 **现象**：把模板同步到消费者仓库后，watcher 每 10 秒崩溃重启：
 ```
@@ -425,7 +425,7 @@ SyntaxError: The requested module './lib.mjs' does not provide an export named '
 
 ---
 
-## 20. `gh auth switch` 是全局状态，与并发流水线天然竞争
+## 23. `gh auth switch` 是全局状态，与并发流水线天然竞争
 
 **背景**：本机同时存在多个常驻会话（qc-gas/维护仓库两个 watcher、两个 PM+筛选、本机探针），
 它们随时可能调用 `gh`（轮询 issue、发评论、关闭 issue、推送）。而 `gh auth switch` 会改写
@@ -442,3 +442,60 @@ SyntaxError: The requested module './lib.mjs' does not provide an export named '
 
 **教训**：CLI 工具的"**全局配置切换**"与"**多进程并发**"在架构上互斥。
 凡是需要多身份的地方，一律走**每进程凭据**，不要走全局开关。
+
+---
+
+## 24. 合并结果必须以 PR 真实状态为准（命令报错 ≠ 合并失败）
+
+**现象**（本仓库真实发生，issue #14 / PR #15）：自动合并**已经成功**，流水线却宣告
+"❌ 自动合并失败（可能受分支保护限制）…请手动合并 PR #15"，把 issue 置为 `needs_human`
+并留言让人去合并一个**已经合并**的 PR：
+
+- `gh pr merge 15 --squash --delete-branch` 报
+  `could not determine current branch: failed to run git: not on any branch`（17:23:34Z）；
+- 但 `gh pr view 15 --json state,mergedAt` 显示 `mergedAt = 2026-10-11T17:23:32Z`
+  —— **比那条报错日志早 2 秒**，合并早已成功；
+- 远程分支 `agent/14` 至今仍在（`--delete-branch` 的远程删除也没做完）；
+- `.agent/state.json` 里 #14 卡在 `needs_human`，而 issue #14 已是 CLOSED
+  —— 状态机与现实永久背离：既不重试、也不收尾。
+
+**根因**：
+1. `finishMerge()` 把 `gh pr merge` 的**退出码**当成合并结果的事实来源。但
+   `gh pr merge --delete-branch` 的语义是「**先合并，再删本地与远程分支**」
+   （`--delete-branch` = "Delete the local and remote branch after merge"）；删本地分支需要
+   「当前分支」，工作区 **detached HEAD** 时 gh 抛 `ErrNotOnAnyBranch` —— 于是
+   **合并在前、报错在后**，"成功"被读成"失败"。这是已知坑（topij/agentic-dev-kit#196、
+   aleskalfas/project-kit#878、cli/cli#2833）。
+2. 工作区之所以 detached：`processIssue()` 的 finally 只在 `startBranch !== 'HEAD'` 时恢复分支，
+   一旦 detached 就再也回不去 —— detached 变成**永久状态**。
+3. 违反通用原则：不可逆动作必须以「读回的**真实状态**」判定结果，而不是退出码
+   （"Exit 0 Is Not Success: verify outcomes"）。
+
+**修复**：
+- `templates/lib.mjs` 新增纯函数 `classifyMergeAttempt({ error, pr })` →
+  `merged`（`pr.state==='MERGED'` 或 `pr.mergedAt`，**退出码非零也算**）/
+  `blocked`（读回确认 `OPEN`/`CLOSED`，确实未合并）/
+  `unknown`（读不到状态 → fail-closed）。
+- `templates/pipeline.mjs` `finishMerge()`：合并**前**若本地是 detached
+  （`git rev-parse --abbrev-ref HEAD` === `HEAD`）先 best-effort `git checkout <BASE>`
+  （失败仅 warn），让 `--delete-branch` 的本地收尾有分支可用；保留原合并命令，但
+  **无论成败都读回** `gh pr view <n> --json state,mergedAt,headRefName`（读回失败 → `pr=null`），
+  再用 `classifyMergeAttempt` 分流：`merged` → 记 `merged`、评论"🎉 已合并"（若命令报错则
+  附加说明"以真实状态为准"）+ 尽力 `gh api DELETE …/git/refs/heads/<branch>` 清理残留远程分支
+  （失败只 warn）；`blocked` → `needs_human` + 评论含错误原文并**明确"读回确认未合并"**；
+  `unknown` → `needs_human` + 评论"无法确认合并结果，已按未合并处理，请人工确认"。
+  不再出现「命令报错 ⇒ 直接判合并失败」。
+- `scripts/validate.mjs` check 15：纯函数断言（**含核心回归：真实错误串 + `state=MERGED` → `merged`**、
+  `pr=null`→`unknown`、`OPEN`→`blocked`、`{}`→`unknown`）+ `finishMerge()` 顺序断言
+  （`gh pr view` 读回与 `classifyMergeAttempt(` 必须在写 `needs_human` 的代码**之前**）
+  + detached 兜底与远程分支清理文本断言 + lessons 编号唯一性。
+
+**教训**：
+- **不可逆动作只认读回的真实状态**，退出码只是"命令有没有正常返回"，不是"世界变成了什么样"。
+  先做不可逆动作、再读回、再据此决定状态机走向；读不到状态一律 **fail-closed**。
+- 一个命令可能**部分成功**（合并成功、清理失败）：不要用它的退出码去否定它已经做成的部分，
+  也不要把"收尾失败"升级成"主操作失败"。
+- 会让工作区变 detached 的路径必须**可恢复**：`finally` 只在非 detached 时恢复分支，
+  等于把一次性异常固化成永久状态。
+- 状态机的终态必须与现实一致：`needs_human` 只在**确实没合并/无法确认**时出现，
+  否则 issue 会永久卡在非终态、既不重试也不收尾。

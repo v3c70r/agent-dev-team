@@ -65,7 +65,7 @@ pi 会按 [`SKILL.md`](SKILL.md) 的步骤：做 preflight 检查 → 询问你�
 > **撤回一次批准**：在 issue 下回复 `/reject` —— 它会移除 `agent-approved`（pipeline 取活
 > 只看这个触发标签）、打上 `agent-rejected`，该 issue 从此不再被接管，也**不会被自动合并**。
 > 边界：若实现**已经在运行**，`/reject` **不会中断**当前 pi 会话（只保证下一轮不再接管、PR 不自动合并）；
-> 想恢复，再回复 `/approve` 即可（会移除 `agent-rejected`）。详见 [`docs/lessons.md`](docs/lessons.md) #19。
+> 想恢复，再回复 `/approve` 即可（会移除 `agent-rejected`）。详见 [`docs/lessons.md`](docs/lessons.md) #20。
 
 ## 配置
 

@@ -50,7 +50,13 @@
 `origin/<branch>` 已存在则 `checkout <branch>` + `reset --hard origin/<branch>`（**基于 PR 现有分支**
 继续提交），否则才从 `origin/<base>` 新开分支 —— harness 绝不在 base 上提交修复。
 `state.json` 的 `round`（审查轮）与 `fixes`（测试修复轮）经 `lib.mergeIssueState()` **合并**写入，
-不会被实现轮覆盖（lesson #18）。
+不会被实现轮覆盖（lesson #19）。
+
+合并是**不可逆**动作，以 PR 的**真实状态**为准：`finishMerge()` 在
+`gh pr merge --delete-branch` 之后读回 `gh pr view --json state,mergedAt,headRefName`，
+再用 `lib.classifyMergeAttempt()` 分流 —— 命令报错但 `state=MERGED` 仍记 `merged`
+（detached HEAD 下 `--delete-branch` 会「先合并、后报错」），合并前会 best-effort 切回 `BASE`；
+读不到状态则 fail-closed（`needs_human`）；合并成功后尽力清理残留的远程分支（lesson #24）。
 
 ## 共享记忆
 
