@@ -151,8 +151,34 @@ function log(issueNum, msg) {
   const f = path.join(LOG_DIR, `issue-${issueNum}.md`);
   writeFileSync(f, (existsSync(f) ? readFileSync(f, 'utf8') : '') + `\n[${new Date().toISOString()}] ${msg}\n`);
 }
-function commentOnIssue(num, body) { gh(['issue', 'comment', String(num), '--body', body]); }
-function commentOnPr(num, body) { gh(['pr', 'comment', String(num), '--body', body]); }
+// ── 下发前置防线：任何 GitHub 正文在发出前扫描令牌特征 ──
+// 2026-10-16 真实事故：评论正文里的 `$(gh auth token --user <owner>)` 被 shell
+// 展开成**真令牌**并贴进 PR 评论 → GitHub 秘密扫描自动吊销 → 全链路 401，
+// 流水线卡死。提示词里写了禁令也可能被绕过，所以必须在**代码层**硬拦：
+// 一旦命中特征就拒绝发送（throw），宁可不发评论也不泄漏凭据（lessons #26）。
+const SECRET_PATTERNS = [
+  /\bgh[pousr]_[A-Za-z0-9]{16,}\b/,        // GitHub OAuth / PAT / user / server token
+  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/,      // fine-grained PAT
+  /\bglpat-[A-Za-z0-9_-]{16,}\b/,          // GitLab
+  /\bsk-[A-Za-z0-9_-]{16,}\b/,             // OpenAI-style secret key
+  /\bAKIA[0-9A-Z]{16}\b/,                  // AWS access key id
+  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/,      // Slack
+];
+function assertNoSecrets(text, where = 'GitHub 正文') {
+  const str = String(text ?? '');
+  for (const re of SECRET_PATTERNS) {
+    const m = str.match(re);
+    if (m) {
+      // 报错里只暴露前 6 位，避免把泄漏内容再写进日志/工单
+      throw new Error(
+        `拒绝发送 ${where}：正文中含疑似凭据（${m[0].slice(0, 6)}…，len=${m[0].length}）。` +
+        '这是硬拦截，请移除凭据后重试（docs/lessons.md #26）');
+    }
+  }
+  return str;
+}
+function commentOnIssue(num, body) { gh(['issue', 'comment', String(num), '--body', assertNoSecrets(body, `issue #${num} 评论`)]); }
+function commentOnPr(num, body) { gh(['pr', 'comment', String(num), '--body', assertNoSecrets(body, `PR #${num} 评论`)]); }
 
 // Get approved open issues that have no terminal state
 function approvedIssues() {
@@ -201,7 +227,7 @@ async function runImplementer(issue, roundNote = '') {
       `🤖 Agent A (自动实现) — 来自 approved issue #${issue.number}.`,
       `标题: ${issue.title}`,
     ].join('\n');
-    gh(['pr', 'create', '--base', BASE, '--head', branch, '--title', `Agent: ${issue.title}`, '--body', body]);
+    gh(['pr', 'create', '--base', BASE, '--head', branch, '--title', `Agent: ${issue.title}`, '--body', assertNoSecrets(body, 'PR 正文')]);
     for (let i = 0; i < 5 && !pr; i++) {
       await new Promise(r => setTimeout(r, 2000));
       pr = prForBranch(branch);
@@ -778,6 +804,8 @@ async function main() {
     }
   }
 }
+
+export { assertNoSecrets, SECRET_PATTERNS };
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {

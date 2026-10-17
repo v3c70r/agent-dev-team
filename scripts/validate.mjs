@@ -107,6 +107,29 @@ for (const [t, live] of PAIRS) {
   }
 }
 
+// 7d) **下发前令牌特征拦截**必须存在且真的会拦（lessons #26：真令牌曾被 shell 展开
+// 贴进 PR 评论 → GitHub 自动吊销 → 全链路 401）。这里做功能测试，而不是只 grep 源码。
+{
+  const url = 'file://' + path.join(ROOT, '.agent/pipeline.mjs').replace(/\\/g, '/');
+  const probe = `
+    const m = await import(${JSON.stringify(url)});
+    const bad = ['gho_' + 'a'.repeat(36), 'github_pat_' + 'b'.repeat(30), 'sk-' + 'c'.repeat(24)];
+    const msgs = [];
+    for (const t of bad) { try { m.assertNoSecrets('正文 ' + t); msgs.push('NOT-BLOCKED'); } catch { msgs.push('blocked'); } }
+    let okText = 'ok';
+    try { m.assertNoSecrets('普通正文，不含任何凭据。'); } catch (e) { okText = 'FALSE-POSITIVE'; }
+    console.log(JSON.stringify({ msgs, okText }));`;
+  try {
+    const out = execFileSync('node', ['--input-type=module', '-e', probe], { cwd: ROOT, encoding: 'utf8', stdio: 'pipe' });
+    const r = JSON.parse(out.trim().split('\n').pop());
+    if (r.msgs.some(x => x !== 'blocked')) fail('assertNoSecrets 未拦截某些令牌形态: ' + JSON.stringify(r.msgs));
+    else if (r.okText !== 'ok') fail('assertNoSecrets 对正常文本误报');
+    else ok('assertNoSecrets blocks token shapes, passes normal text');
+  } catch (e) {
+    fail('assertNoSecrets 功能测试失败: ' + String((e.stderr || e.message) || '').split('\n').slice(0, 3).join(' '));
+  }
+}
+
 // 8. doctor dogfood self-check: `npm run doctor` must be green in THIS repo
 // (its stdout is reused by check 11 so we only pay for the slow model probe once)
 let doctorHumanOut = '';
