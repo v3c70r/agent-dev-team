@@ -343,12 +343,35 @@ const CHECKS = [
 ];
 
 // ── render + exit ──
-const jsonMode = process.argv.slice(2).includes('--json');
+// CLI: [--json] [--skip <name[,name]>]
+//
+// `--skip` 是为了把「**这台机器**」与「**这个仓库**」分开：tmux / gh 登录 / pi /
+// 模型探针 / labels 这些项描述的是**宿主环境**，在没有 tmux、没有网络、没有 gh
+// 登录的 CI 容器里必然红。维护仓自己的 `npm test` 会 dogfood `doctor`，若不允许跳过，
+// 容器里就永远是 “doctor not green” → **每个 PR 都被测试卡死**（lessons #27）。
+// 真实安装的 preflight **不得**使用 --skip（SKILL.md 要求全绿）。
+const ARGV = process.argv.slice(2);
+const jsonMode = ARGV.includes('--json');
+const iSkip = ARGV.indexOf('--skip');
+const skipPresent = iSkip !== -1;
+const skipRequested = skipPresent ? String(ARGV[iSkip + 1] ?? '').split(',').map(s => s.trim()).filter(Boolean) : [];
+const knownNames = CHECKS.map(c => c.name);
+const skippedNames = skipRequested.filter(n => knownNames.includes(n));
+const unknownSkips = skipRequested.filter(n => !knownNames.includes(n));
 
-const results = CHECKS.map((c) => {
-  try { return { name: c.name, ...c.run() }; }
-  catch (e) { return { name: c.name, status: 'fail', detail: `异常: ${e.message}`, fix: '见上方错误信息' }; }
-});
+const results = CHECKS
+  .filter(c => !skippedNames.includes(c.name))
+  .map((c) => {
+    try { return { name: c.name, ...c.run() }; }
+    catch (e) { return { name: c.name, status: 'fail', detail: `异常: ${e.message}`, fix: '见上方错误信息' }; }
+  });
+
+// 拼错/空值的 --skip 必须**喷出来**，否则漏检会被静默当成“全绿”
+if (skipPresent && !skipRequested.length) {
+  results.unshift({ name: '--skip', status: 'fail', detail: '--skip 需要参数（逗号分隔的检查项名）', fix: `可用检查项: ${knownNames.join(', ')}` });
+} else if (unknownSkips.length) {
+  results.unshift({ name: '--skip', status: 'fail', detail: `未知的检查项: ${unknownSkips.join(', ')}`, fix: `可用检查项: ${knownNames.join(', ')}` });
+}
 
 let pass = 0, fail = 0, warn = 0;
 for (const r of results) {
@@ -369,6 +392,7 @@ if (jsonMode) {
 }
 
 console.log('\n🔍 agent-dev-team doctor — 环境自检');
+if (skippedNames.length) console.log(`跳过（--skip）: ${skippedNames.join(', ')} —— 这些项描述宿主环境，不反映仓库健康`);
 console.log('─'.repeat(80));
 console.log('状态  检查项' + ' '.repeat(9) + '结果 / 修复建议');
 console.log('─'.repeat(80));

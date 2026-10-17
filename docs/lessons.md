@@ -618,3 +618,54 @@ SyntaxError: The requested module './lib.mjs' does not provide an export named '
 - **不可见的失败等于没修**：只给"重试"不够，还要能回答"现在到底哪些卡住了"
   （`retry --list`），否则 stuck 状态会像反面样本那样静默堆积。
 - 每次恢复都要留痕（计数 + 日志 + 评论），恢复动作本身就是度量数据。
+
+---
+
+## 27. 测试 dogfood 了「宿主检查」→ 容器里 `npm test` 永远红，每个 PR 都被卡死
+
+**现象**（2026-10-17，issue #19 / PR #20 的真实卡点）：Agent C 在测试容器里跑 `npm test`，
+报 `1 FAILURE(S)`，唯一失败是：
+
+```
+✗ doctor not green:
+✗     tmux          tmux 不存在
+```
+
+而本 PR **完全没碰** `doctor.mjs`，功能测试的全部 55+ 条断言都是 ✓ —— 也就是说：
+**健康的功能改动因为容器里没装 tmux 被判失败**，issue 被置回 `needs_human`，
+并且（讽刺地）只能用本 PR 新加的 `agent:retry` 才能恢复。
+
+**根因**：
+
+1. `scripts/validate.mjs` 的 check 8「doctor dogfood」要求 `node scripts/doctor.mjs` **全绿**，
+   而 `doctor` 混了两类检查：
+   - **仓库类**（`.gitignore`、`build/test` scripts、`config.json`、`pipeline/lib` 一致…）——
+     反映代码健康，`npm test` 应该管；
+   - **宿主类**（`tmux`、`gh auth`/`gh repo`、`pi`、模型探针、`reviewer 账号`、`labels`…）——
+     反映**这台机器**，在 CI/测试容器里天然缺（无 tmux、无网络、无 gh 登录）。
+2. 两类混在一个"全绿才通过"的口径里 → **测试结果依赖于跑测试的机器**。
+   机器一换（容器、CI、同事笔记本）结论就变，这类测试是不可复现的。
+3. 更糟的激励：为了让 `npm test` 变绿，人们会给容器装 tmux / 造 gh 登录 ——
+   把一个业务仓库的测试套件绑死在宿主配置上。
+
+**修复**：
+
+- `scripts/doctor.mjs` 支持 `--skip <name[,name]>`：跳过点名的检查项（只用于宿主类）。
+  拼错/空值必须**喷出来**（产生 `name: '--skip', status: 'fail'` 的检查项并 exit 非 0），
+  否则漏检会被静默当成"全绿"—— 那比不做更危险。
+- `scripts/validate.mjs`：check 8/11/12 调 doctor 时统一带
+  `--skip tmux,gh auth,gh repo,pi,模型可用性,reviewer 账号,labels`，
+  并在 ✓ 行里**写明**跳过了哪些项（不假装检查过）；另加 check 11b 断言 `--skip` 机制本身
+  （跳过生效、未知项报错、仓库类检查不被连带跳过）。
+- 真实安装的 preflight **不得**用 `--skip`：`SKILL.md` 第一步依旧要求 doctor 全绿，
+  因为那正是"这台机器能不能跑这套 loop"的判定。
+
+**教训**：
+
+- **测试必须可复现**：断言要能被任意干净容器重放。凡是"结果取决于跑测试那台机器"的检查，
+  要么移出测试套件，要么显式声明并按类跳过 —— 否则它会变成随机失败源，并训练人去
+  "修环境"而不是"修代码"。
+- **跳过必须可见、必须无副作用**：`--skip` 只减项、不改变其余判定，并且在输出与测试日志里
+  列出名字；拼错即报错。**静默跳过 = 假绿**。
+- 环境和代码要分层：`doctor` 面向"装/跑"（全绿口径），`validate` 面向"仓库是否健康"
+  （只看仓库类）。同一个脚本同时服务两者时，**必须提供按类裁剪的入口**。

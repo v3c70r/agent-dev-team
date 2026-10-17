@@ -132,15 +132,23 @@ for (const [t, live] of PAIRS) {
 
 // 8. doctor dogfood self-check: `npm run doctor` must be green in THIS repo
 // (its stdout is reused by check 11 so we only pay for the slow model probe once)
+//
+// 宿主相关检查必须用 `--skip` 排除：tmux / gh 登录 / pi / 模型探针 /
+// labels 描述的是**这台机器**，不是这个仓库。它们在没有 tmux / 没有网络 /
+// 没有 gh 登录的 CI 容器里必然红 → `npm test` 永远红 → **每个 PR 都被测试卡死**
+// （Agent C 实测：容器无 tmux，功能测试失败，见 docs/lessons.md #27）。
+// 真机安装的 preflight 仍然要求全绿（SKILL.md）。
+const DOCTOR_HOST_CHECKS = ['tmux', 'gh auth', 'gh repo', 'pi', '\u6a21\u578b\u53ef\u7528\u6027', 'reviewer \u8d26\u53f7', 'labels'];
+const DOCTOR_SKIP_ARGS = ['--skip', DOCTOR_HOST_CHECKS.join(',')];
 let doctorHumanOut = '';
 {
   try {
-    doctorHumanOut = execFileSync('node', [path.join(ROOT, 'scripts/doctor.mjs')], { cwd: ROOT, encoding: 'utf8', stdio: 'pipe' });
-    ok('doctor green');
+    doctorHumanOut = execFileSync('node', [path.join(ROOT, 'scripts/doctor.mjs'), ...DOCTOR_SKIP_ARGS], { cwd: ROOT, encoding: 'utf8', stdio: 'pipe' });
+    ok(`doctor green（仓库类检查；宿主相关项已按 CI 跳过：${DOCTOR_HOST_CHECKS.join(', ')}）`);
   } catch (e) {
     doctorHumanOut = String(e.stdout || '');
     const out = [e.stdout, e.stderr].filter(Boolean).join('\n').trim();
-    fail(`doctor not green:\n${out}`);
+    fail(`doctor not green (仓库类检查):\n${out}`);
   }
 }
 
@@ -169,7 +177,7 @@ let doctorHumanOut = '';
       return { out: String(e.stdout || ''), code: e.status };
     }
   };
-  const { out: jsonOut, code } = runDoctor(['--json']);
+  const { out: jsonOut, code } = runDoctor(['--json', ...DOCTOR_SKIP_ARGS]);
   let data;
   try { data = JSON.parse(jsonOut); } catch (e) { data = null; fail(`doctor --json 输出不是合法 JSON: ${e.message}`); }
   if (data) {
@@ -196,6 +204,28 @@ let doctorHumanOut = '';
   const markers = ['🔍 agent-dev-team doctor', '结果：', '─'.repeat(80)];
   const missing = markers.filter(m => !doctorHumanOut.includes(m));
   missing.length ? fail(`doctor 人类表格输出回归（缺: ${missing.join(' / ')}）`) : ok('doctor 人类表格输出未回归');
+
+  // 11b. `--skip` 机制本身：跳过生效 + 未知名字必须报错（拼错不能变成“假全绿”）
+  {
+    const skipped = runDoctor(['--json', '--skip', 'tmux,模型可用性']);
+    let d = null;
+    try { d = JSON.parse(skipped.out); } catch { /* asserted below */ }
+    if (!d?.checks) fail('doctor --json --skip: 输出不可解析');
+    else if (d.checks.some(c => c.name === 'tmux')) fail('doctor --skip tmux 未生效（tmux 检查仍在输出里）');
+    else if (d.summary.pass + d.summary.fail + d.summary.warn !== d.checks.length) fail('doctor --skip 后 summary 计数与 checks 不符');
+    else ok('doctor --skip <name> 生效，且 --json schema 仍自洽');
+    const bad = runDoctor(['--json', '--skip', 'tmux,model-availability']);
+    let db = null;
+    try { db = JSON.parse(bad.out); } catch { /* asserted below */ }
+    if (bad.code === 0) fail('doctor --skip <未知检查项> 仍 exit 0（拼错会静默变成假全绿）');
+    else if (!db?.checks?.some(c => c.name === '--skip' && c.status === 'fail')) fail('doctor --skip <未知检查项> 未产生 fail 检查项（未明确指出拼错）');
+    else ok('doctor --skip <未知检查项> → exit 非 0 且明确指出未知项');
+    const fileCheck = runDoctor(['--json', '--skip', 'tmux,模型可用性']);
+    let df = null;
+    try { df = JSON.parse(fileCheck.out); } catch { /* asserted below */ }
+    if (!df?.checks?.some(c => c.name === '.gitignore')) fail('doctor --skip 后仓库类检查（.gitignore）不应被跳过');
+    else ok('doctor --skip 只跳过点名项（仓库类检查仍在）');
+  }
 }
 
 // 12. Agent C 的构建/测试命令必须可配置（lesson #17 的收尾）
@@ -233,7 +263,7 @@ let doctorHumanOut = '';
   try {
     let out = '';
     try {
-      out = execFileSync('node', [path.join(ROOT, 'scripts/doctor.mjs'), '--json'], {
+      out = execFileSync('node', [path.join(ROOT, 'scripts/doctor.mjs'), '--json', ...DOCTOR_SKIP_ARGS], {
         cwd: tmp,
         encoding: 'utf8',
         stdio: 'pipe',

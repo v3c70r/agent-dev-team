@@ -42,6 +42,11 @@ CI / 脚本需要机器可读结果时，加 `--json`（等价 `npm run doctor:j
 `node /path/to/agent-dev-team/scripts/doctor.mjs --json`（若已在目标仓库加了 npm script，
 则用 `npm run --silent doctor -- --json`）。
 
+> **`--skip` 的边界**：它在**跑本技能仓库自身的测试**时按类绊除宿主检查（例如
+> `node scripts/doctor.mjs --skip 'tmux,模型可用性'`），因为 CI/容器里没 tmux、没网络，
+> 否则 `npm test` 永远红（lessons #27）。**真实安装不要用**：preflight 的每一项都在回答
+> “这台机器能不能跑 loop”。拼错检查名会 exit 非 0（不允许静默假绿）。
+
 同时确认（决定 Agent C 如何工作）：
 - 仓库的构建/测试命令：默认为 `npm run build` / `npm test`（doctor 在 `package.json` 有对应
   scripts 时通过）。**非 npm 仓库必须显式配置 `AGENT_BUILD_CMD` / `AGENT_TEST_CMD`**
