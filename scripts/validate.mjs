@@ -92,6 +92,21 @@ for (const [t, live] of PAIRS) {
   ok('prompt guards: global-auth ban + --body-file present');
 }
 
+// 7c) **模块级**运行时守卫：pipeline.mjs 必须能被干净地 import。
+// `node --check` 只做语法检查，抓不到初始化顺序错误（TDZ）——2026-10-17 实测过
+// `Cannot access 'CFG_JSON' before initialization` 让 watcher 无限崩溃重启，
+// 而 validate 当时全绿。import 不触发 main()（有 isMain 守卫）。
+{
+  const url = 'file://' + path.join(ROOT, '.agent/pipeline.mjs').replace(/\\/g, '/');
+  try {
+    execFileSync('node', ['--input-type=module', '-e', `await import(${JSON.stringify(url)})`],
+      { cwd: ROOT, encoding: 'utf8', stdio: 'pipe' });
+    ok('pipeline module imports cleanly (no TDZ / init-order bug)');
+  } catch (e) {
+    fail('pipeline module failed to import: ' + String((e.stderr || e.message) || '').split('\n').slice(0, 3).join(' '));
+  }
+}
+
 // 8. doctor dogfood self-check: `npm run doctor` must be green in THIS repo
 // (its stdout is reused by check 11 so we only pay for the slow model probe once)
 let doctorHumanOut = '';

@@ -93,31 +93,41 @@ function reportGap(title, body) {
 
 // ── tiny helpers ──
 // ── reviewer identity (optional separate GitHub account) ──
-// .agent/config.json: { "reviewerGhUser": "qgu-reviewer" }  (env REVIEWER_GH_USER wins)
+// .agent/config.json: { "reviewerGhUser": "qgu-reviewer" }  (env reviewerGhUser() wins)
 // Purpose: Agent B (and its批准 review) should act as a *different* account than
 // the implementer, so the approval is a genuine second identity instead of the
 // "cannot approve your own PR" workaround (docs/lessons.md #4).
 // NEVER use `gh auth switch` here: it rewrites the global gh config and races with
 // the other pipelines/sessions calling gh on the same machine (lesson #23).
 // Pass a per-process GH_TOKEN instead.
-const REVIEWER_GH_USER = String(process.env.REVIEWER_GH_USER || CFG_JSON.reviewerGhUser || '').trim();
+// 注意：CFG_JSON 在本文件靠后处才初始化（`const CFG_JSON = loadConfig()`），
+// 所以这里**不能**在模块顶层读它 —— 会触发 TDZ（ReferenceError: Cannot access
+// 'CFG_JSON' before initialization），watcher 直接起不来（2026-10-17 实测事故）。
+// 改成惰性读取：第一次调用时才解析配置。
+let _reviewerGhUser;
+function reviewerGhUser() {
+  if (_reviewerGhUser === undefined) {
+    _reviewerGhUser = String(process.env.REVIEWER_GH_USER || CFG_JSON.reviewerGhUser || '').trim();
+  }
+  return _reviewerGhUser;
+}
 let _reviewerEnvCache;
 function reviewerEnv() {
-  if (!REVIEWER_GH_USER) return {};
+  if (!reviewerGhUser()) return {};
   if (_reviewerEnvCache !== undefined) return _reviewerEnvCache;
   try {
-    const tok = sh(['gh', 'auth', 'token', '--user', REVIEWER_GH_USER]).trim();
+    const tok = sh(['gh', 'auth', 'token', '--user', reviewerGhUser()]).trim();
     _reviewerEnvCache = tok ? { ...process.env, GH_TOKEN: tok } : {};
-    if (!tok) console.warn(`[reviewer] ${REVIEWER_GH_USER} 无可用 token，回退到当前 gh 账号`);
+    if (!tok) console.warn(`[reviewer] ${reviewerGhUser()} 无可用 token，回退到当前 gh 账号`);
   } catch (e) {
-    console.warn(`[reviewer] 无法获取 ${REVIEWER_GH_USER} 的 token（${e.message}），回退到当前 gh 账号`);
+    console.warn(`[reviewer] 无法获取 ${reviewerGhUser()} 的 token（${e.message}），回退到当前 gh 账号`);
     _reviewerEnvCache = {};
   }
   return _reviewerEnvCache;
 }
 /** 该 reviewer 账号是否有写权限（决定其批准能否计入 branch protection 的 required reviews） */
 function reviewerCanCountApproval() {
-  if (!REVIEWER_GH_USER) return null;
+  if (!reviewerGhUser()) return null;
   try {
     const nwo = ghJson(['repo', 'view', '--json', 'nameWithOwner']).nameWithOwner;
     const out = sh(['gh', 'api', `repos/${nwo}`, '--jq', '.permissions.push'], { env: reviewerEnv() }).trim();
@@ -549,20 +559,20 @@ async function finishMerge(issueNum, prNum) {
   }
   // ── 批准：优先用独立 reviewer 账号提交**真实** approve review ──
   // （同一账号无法批准自己的 PR —— lessons #4；因此推荐配置第二个账号）
-  const approveBody = `🤖 Agent B 已批准 + Agent C 测试通过${REVIEWER_GH_USER ? `（批准账号：${REVIEWER_GH_USER}）` : ''}`;
+  const approveBody = `🤖 Agent B 已批准 + Agent C 测试通过${reviewerGhUser() ? `（批准账号：${reviewerGhUser()}）` : ''}`;
   let approvalNote = '';
-  if (REVIEWER_GH_USER) {
+  if (reviewerGhUser()) {
     try {
       gh(['pr', 'review', String(prNum), '--approve', '--body', approveBody], { env: reviewerEnv() });
       const counts = reviewerCanCountApproval();
       approvalNote = counts === true
-        ? `批准由独立账号 **${REVIEWER_GH_USER}** 提交（该账号有写权限，可计入分支保护的 required reviews）。`
+        ? `批准由独立账号 **${reviewerGhUser()}** 提交（该账号有写权限，可计入分支保护的 required reviews）。`
         : counts === false
-          ? `批准由独立账号 **${REVIEWER_GH_USER}** 提交 —— 但该账号只有只读权限，**此批准不会计入分支保护的 required reviews**（需要硬门禁请给它 write 权限）。`
-          : `批准由独立账号 **${REVIEWER_GH_USER}** 提交。`;
+          ? `批准由独立账号 **${reviewerGhUser()}** 提交 —— 但该账号只有只读权限，**此批准不会计入分支保护的 required reviews**（需要硬门禁请给它 write 权限）。`
+          : `批准由独立账号 **${reviewerGhUser()}** 提交。`;
     } catch (e) {
       console.warn('[reviewer] 独立账号批准失败，回退到当前账号：' + e.message);
-      log(issueNum, `B: 独立账号 ${REVIEWER_GH_USER} 批准失败（${e.message}），回退`);
+      log(issueNum, `B: 独立账号 ${reviewerGhUser()} 批准失败（${e.message}），回退`);
     }
   }
   if (!approvalNote) {
