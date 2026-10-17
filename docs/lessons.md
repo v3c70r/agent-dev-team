@@ -537,3 +537,135 @@ SyntaxError: The requested module './lib.mjs' does not provide an export named '
 
 **教训**：把"完成任务"的激励和一个**全局副作用**的命令放在一起，agent 几乎必然按错。
 凡是"全局状态变更"（认证、git config、系统 crontab）都必须视为**越权**，从工具层禁用。
+
+---
+
+## 26. 终态必须可撤销：没有恢复入口的 `needs_human` = issue 永久卡住
+
+**现象**（本仓库真实案例）：
+
+1. issue #14：合并**已经成功**（`mergedAt=2026-10-11T17:23:32Z`），`state.json` 却永久停在
+   `needs_human`。没有任何命令能"重放对账"，`agent/14` 远程分支至今残留。
+2. 上游 issue #18 至今 **OPEN**：下游仓库 qc-gas 的 `gh pr create` 报 `must be a collaborator`
+   → 异常 → `needs_human`。分支已推、PR 没建、issue 卡死；恢复只能手改 **gitignored** 的
+   `.agent/state.json`（重启容器/换机器就没了）。
+3. `needs_human` 有 5 处写入点（审查轮耗尽、合并前无法确认 `/reject`、合并 blocked/unknown、
+   未预期异常），`failed` 有 1 处（测试修复轮耗尽）—— **每一类失败都通往这个死胡同**。
+4. 全仓 grep 无任何"重试/恢复"说明（`README.md`、`SKILL.md`、`docs/architecture.md`
+   只写"请人工处理"）。唯一逃生口是**未文档化**的 `run --issue N --force`，而 `--force`
+   同时绕过 `/reject` 检查（`if (isRejectedIssue(issue) && !force)`）—— 人类为了救一个卡住的
+   issue，可能顺手复活一个已被否决的 issue（合并虽仍被 `finishMerge` 的活标签复查挡住，
+   但 A/B/C 的钱和时间已经烧掉）。
+
+同类项目独立踩过四例：
+
+- ForgeDock #3571（已修复）：`needs-human` 终态后 `--retry` 拒绝重开，运维只能手改
+  `FORGE:STATE`；修法 =「人类清掉标签即 hand-back 信号，可重开，但**仍带标签的运行永不重开**」。
+  https://github.com/RapierCraftStudios/ForgeDock/issues/3571
+- know_thy_build #156：按**原因**分类 —— 引擎缺陷类允许"新版本后自动重试一次"，
+  人类判断类（审查轮耗尽/需人工合并/超预算）永不自动重试。
+  https://github.com/LeeHyeonKyu/know_thy_build/issues/156
+- viberpit #1540：`gave_up` 行无 un-park 入口 → 要求"人类手工编辑即 hand-back 信号"
+  或 "retry now" 动作。 https://github.com/steiner385/viberpit/issues/1540
+- 反面样本：ojones/ai-factory 的 `Stuck run [needs_human]` issue 一直堆着（没人清理，
+  因为清理本身没有入口）。 https://github.com/ojones/ai-factory/issues/121
+
+**根因**：
+
+1. **状态机把"失败"当成了"结束"**：`needs_human` / `failed` 被 `selectPendingIssues()`
+   列入终态硬跳过（这是对的 —— 自动重试会烧钱），但**没有提供任何显式的人工逆向转移**。
+   终态一旦不可撤销，就等于把"人类修好根因后继续"这条路封死。
+2. **唯一逃生口恰好是最危险的那个**：`--force` 把"重试"和"绕过否决"绑在一起，
+   激励结构逼着人类用越权手段办正事（同 lessons #25 的"全局状态变更"模式）。
+3. **状态在 gitignored 的本地文件里**：手改 `state.json` 不可审计、不可复现、
+   换机器就丢 —— 而"可审计"正是整套 loop 的核心价值。
+
+**修复**：
+
+- `templates/lib.mjs` 新增纯函数 `retryReset(prev)` → `{ ok:true, next }` | `{ ok:false, reason }`：
+  只允许 `needs_human` / `failed`；`next` 保留 `pr`/`branch`/`round`/`fixes`，
+  `status` = `prev.pr ? 'pr_open' : 'new'`（无 PR 则从头实现），`retries+1`、
+  `retriedAt`（ISO）、`previousStatus` 留痕，旧 `error` 移入 `lastError` 后清空。
+  `merged`（不可逆）/ `rejected`（否决优先）/ `blocked`（等依赖，不是失败）/ `pr_open`
+  （无需重试）/ 无记录 → 拒绝且不返回 `next`。
+  另有 `formatRetryList(state)`（纯函数）列出"哪些卡住了"。
+- `templates/pipeline.mjs` 新增 `retry` 子命令：
+  `retry --issue N`（也接受裸 `N`）与 `retry --list`。判定顺序是刻意的 ——
+  **纯状态判定 → 读 issue 标签确认 `/reject` → 才写状态**：带 `agent-rejected` 直接
+  exit 2；读不到标签也 fail-closed（同 lessons #24 的合并读回原则）。拒绝时不写状态、
+  不改动 `state.json`（字节级）。成功则写 `state.json`、append `.agent/logs/issue-N.md`、
+  best-effort 在 issue 上评论"已由人工请求重试，将从 <阶段> 继续"并打印下一步。
+  另外把实现入口从 `cur.status === 'pr_open'` 扩到也接受 `'new'` —— 否则"无 PR 的重试"
+  会永久卡在 `waiting_pr`（复位了却没人接）。
+- `package.json`：`"agent:retry": "node .agent/pipeline.mjs retry"`。
+- `scripts/validate.mjs` check 16：`retryReset` 全分支断言（含"纯函数不修改入参"、
+  "拒绝时不返回 next"）、`formatRetryList` 断言、`pipeline` 文本断言
+  （retry 分支走纯函数、`isRejectedIssue` 在 `state.save` 之前、拒绝即 exit 2、
+  **代码里不得出现 `force`**）、以及在 `mkdtemp` 里跑**真实** `pipeline.mjs` 的
+  CLI 端到端测试（配假 `gh`，离线、无副作用）：merged → exit 2 且 state 字节不变、
+  带 `agent-rejected` → exit 2 不写状态、needs_human(有 PR) → `pr_open` 且保留
+  `pr`/`branch`/`round`/`fixes` + `error→lastError` + 写日志、failed(无 PR) → `new`、
+  `--list` 只列 `needs_human`/`failed`。
+- 文档：`docs/architecture.md`（恢复转移图）、`SKILL.md` / `README.md` 命令表。
+
+**教训**：
+
+- **终态必须可撤销**：任何"卡住"状态都要配一个**显式、可审计、幂等**的逆向转移。
+  自动重试可以不做（会烧钱），但**人工重试入口必须有**，否则人类只能手改状态文件。
+- 恢复入口**绝不能顺带打开另一个口子**：重试 ≠ 撤销否决。把"重试"和"绕过 `/reject`"
+  绑在同一个 `--force` 上，等于用激励结构逼人越权。判定顺序要写死：
+  **先否决、后复位**。
+- **不可见的失败等于没修**：只给"重试"不够，还要能回答"现在到底哪些卡住了"
+  （`retry --list`），否则 stuck 状态会像反面样本那样静默堆积。
+- 每次恢复都要留痕（计数 + 日志 + 评论），恢复动作本身就是度量数据。
+
+---
+
+## 27. 测试 dogfood 了「宿主检查」→ 容器里 `npm test` 永远红，每个 PR 都被卡死
+
+**现象**（2026-10-17，issue #19 / PR #20 的真实卡点）：Agent C 在测试容器里跑 `npm test`，
+报 `1 FAILURE(S)`，唯一失败是：
+
+```
+✗ doctor not green:
+✗     tmux          tmux 不存在
+```
+
+而本 PR **完全没碰** `doctor.mjs`，功能测试的全部 55+ 条断言都是 ✓ —— 也就是说：
+**健康的功能改动因为容器里没装 tmux 被判失败**，issue 被置回 `needs_human`，
+并且（讽刺地）只能用本 PR 新加的 `agent:retry` 才能恢复。
+
+**根因**：
+
+1. `scripts/validate.mjs` 的 check 8「doctor dogfood」要求 `node scripts/doctor.mjs` **全绿**，
+   而 `doctor` 混了两类检查：
+   - **仓库类**（`.gitignore`、`build/test` scripts、`config.json`、`pipeline/lib` 一致…）——
+     反映代码健康，`npm test` 应该管；
+   - **宿主类**（`tmux`、`gh auth`/`gh repo`、`pi`、模型探针、`reviewer 账号`、`labels`…）——
+     反映**这台机器**，在 CI/测试容器里天然缺（无 tmux、无网络、无 gh 登录）。
+2. 两类混在一个"全绿才通过"的口径里 → **测试结果依赖于跑测试的机器**。
+   机器一换（容器、CI、同事笔记本）结论就变，这类测试是不可复现的。
+3. 更糟的激励：为了让 `npm test` 变绿，人们会给容器装 tmux / 造 gh 登录 ——
+   把一个业务仓库的测试套件绑死在宿主配置上。
+
+**修复**：
+
+- `scripts/doctor.mjs` 支持 `--skip <name[,name]>`：跳过点名的检查项（只用于宿主类）。
+  拼错/空值必须**喷出来**（产生 `name: '--skip', status: 'fail'` 的检查项并 exit 非 0），
+  否则漏检会被静默当成"全绿"—— 那比不做更危险。
+- `scripts/validate.mjs`：check 8/11/12 调 doctor 时统一带
+  `--skip tmux,gh auth,gh repo,pi,模型可用性,reviewer 账号,labels`，
+  并在 ✓ 行里**写明**跳过了哪些项（不假装检查过）；另加 check 11b 断言 `--skip` 机制本身
+  （跳过生效、未知项报错、仓库类检查不被连带跳过）。
+- 真实安装的 preflight **不得**用 `--skip`：`SKILL.md` 第一步依旧要求 doctor 全绿，
+  因为那正是"这台机器能不能跑这套 loop"的判定。
+
+**教训**：
+
+- **测试必须可复现**：断言要能被任意干净容器重放。凡是"结果取决于跑测试那台机器"的检查，
+  要么移出测试套件，要么显式声明并按类跳过 —— 否则它会变成随机失败源，并训练人去
+  "修环境"而不是"修代码"。
+- **跳过必须可见、必须无副作用**：`--skip` 只减项、不改变其余判定，并且在输出与测试日志里
+  列出名字；拼错即报错。**静默跳过 = 假绿**。
+- 环境和代码要分层：`doctor` 面向"装/跑"（全绿口径），`validate` 面向"仓库是否健康"
+  （只看仓库类）。同一个脚本同时服务两者时，**必须提供按类裁剪的入口**。

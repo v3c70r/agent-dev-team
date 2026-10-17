@@ -42,6 +42,11 @@ CI / 脚本需要机器可读结果时，加 `--json`（等价 `npm run doctor:j
 `node /path/to/agent-dev-team/scripts/doctor.mjs --json`（若已在目标仓库加了 npm script，
 则用 `npm run --silent doctor -- --json`）。
 
+> **`--skip` 的边界**：它在**跑本技能仓库自身的测试**时按类绊除宿主检查（例如
+> `node scripts/doctor.mjs --skip 'tmux,模型可用性'`），因为 CI/容器里没 tmux、没网络，
+> 否则 `npm test` 永远红（lessons #27）。**真实安装不要用**：preflight 的每一项都在回答
+> “这台机器能不能跑 loop”。拼错检查名会 exit 非 0（不允许静默假绿）。
+
 同时确认（决定 Agent C 如何工作）：
 - 仓库的构建/测试命令：默认为 `npm run build` / `npm test`（doctor 在 `package.json` 有对应
   scripts 时通过）。**非 npm 仓库必须显式配置 `AGENT_BUILD_CMD` / `AGENT_TEST_CMD`**
@@ -101,7 +106,8 @@ gh issue create ... 不需要预建，但 label 必须存在
 **npm scripts**（若缺失则添加）：
 ```json
 "agent:watch": "node .agent/pipeline.mjs watch",
-"agent:status": "node .agent/pipeline.mjs status"
+"agent:status": "node .agent/pipeline.mjs status",
+"agent:retry": "node .agent/pipeline.mjs retry"
 ```
 
 **gitignore（必须在首次运行前加，否则运行时文件会被 Agent A 的 `git add -A` 扫进 PR）**：
@@ -207,6 +213,8 @@ pipeline 在开工前会检查这些前置 issue：**只要有未关闭的，就
 | 撤回批准 | issue 下回复 `/reject` —— 移除 `agent-approved`（真正取消触发标签）+ 打上 `agent-rejected`；此后不再被接管，也不会被自动合并 |
 | 看流水线 | `tmux attach -t agent`（Ctrl-b d 脱离） |
 | 状态机 | `npm run agent:status` |
+| **看哪些 issue 卡住了** | `npm run --silent agent:retry -- --list`（列出全部 `needs_human` / `failed`） |
+| **恢复卡住的 issue** | 修好根因（加权限/清额度/手工 rebase…）后：`npm run --silent agent:retry -- --issue <N>` —— 保留 `pr`/`branch`/`round`/`fixes`，`retries+1` 并留日志与 issue 评论，watcher 在 ≤1 个 tick（30s）内接手；`merged`/`rejected`/`blocked`/`pr_open` 一律拒绝（exit 2，状态不变），**带 `agent-rejected` 标签绝不重试** |
 | 单独复审 | `node .agent/pipeline.mjs review --pr <N> --issue <M>` |
 | PM 状态/演练 | `node .agent/pm/run.mjs --check` / `--dry-run --force` |
 | 停止 | `tmux kill-session -t agent`（PM: `-t pm`） |

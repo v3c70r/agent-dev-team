@@ -44,7 +44,34 @@
 ```
 
 持久化在 `.agent/state.json`（本地，gitignored）。终态：
-`merged` / `failed` / `needs_human` / `rejected`。
+`merged` / `failed` / `needs_human` / `rejected` —— 其中 `needs_human` / `failed` 的
+**人工恢复入口**见下节。
+
+### 终态的恢复转移（issue #19）
+
+`needs_human` / `failed` 是**失败终态**：watch 循环按 `lib.selectPendingIssues()` 跳过它们
+（重试必须是**显式人工动作**，不是自动循环）。人类修好根因后用一个确定性命令把条目
+复位到可续跑状态：
+
+```
+needs_human ─┐                        ┌─ 有 pr  → pr_open（从审查/测试继续）
+             ├─ npm run agent:retry ─┤
+failed      ─┘   --issue <N>          └─ 无 pr  → new（从头实现）
+
+merged   ─ retry → 拒绝（不可逆）        exit 2，state.json 不动
+rejected ─ retry → 拒绝（否决优先）      exit 2，state.json 不动
+blocked  ─ retry → 拒绝（等依赖，不是失败；依赖关闭后自动接手）
+pr_open  ─ retry → 拒绝（无需重试）
+```
+
+判定是纯函数 `lib.retryReset(prev)`（pipeline 与 validate 共用，避免两份逻辑漂移）：
+保留 `pr`/`branch`/`round`/`fixes`，`retries+1`、`retriedAt`、`previousStatus` 留痕，
+旧 `error` 移入 `lastError` 后清空。每次重试都会写 `.agent/logs/issue-<N>.md` 并在 issue 上
+留一条评论 —— **可审计、可度量**（为将来的 `stats` 打基础）。
+
+`retry` **绝不绕过 `/reject`**：与 `--force` 不同，它在写状态**之前**先读 issue 标签，
+带 `agent-rejected` 直接 exit 2；读不到标签也 fail-closed（同合并读回的原则，lesson #24）。
+`npm run agent:retry -- --list` 列出全部卡住的条目，让「哪些卡住了」可发现。
 
 修复轮（review `REQUEST_CHANGES` 或 C 测试失败）由 `lib.prepareImplementerBranch()` 准备分支：
 `origin/<branch>` 已存在则 `checkout <branch>` + `reset --hard origin/<branch>`（**基于 PR 现有分支**

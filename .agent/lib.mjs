@@ -72,6 +72,67 @@ export function selectPendingIssues(issues = [], state = {}) {
   });
 }
 
+// ── 终态的人工恢复入口（issue #19）──────────────────────────────────
+// `needs_human` / `failed` 曾经是死胡同：watch 循环把两者当终态跳过，文档也只写
+// 「请人工处理」，唯一的逃生口是未文档化的 `run --issue N --force` —— 而 `--force`
+// **同时绕过 /reject 检查**，人类为了救一个卡住的 issue 可能顺手复活一个已被否决的
+// issue。这里把「能不能重试、重试后从哪继续」抽成一个纯函数，pipeline 的 `retry`
+// 子命令与 validate 共用同一份判定（避免两份逻辑漂移，lessons #26）。
+//
+// 语义：
+//   needs_human / failed → 可重试；`next` 保留既有进度（pr/branch/round/fixes…），
+//     status 复位为 `pr_open`（有 PR，从审查/测试继续）或 `new`（无 PR，从头实现），
+//     retries+1、retriedAt 记录本次时间、previousStatus 保留旧状态用于审计，
+//     旧 `error` 移入 `lastError` 后清空（错误已受理，但保留证据）。
+//   merged   → 不可逆，永不可重试
+//   rejected → 否决优先，重试不适用（要恢复请先 /approve 解除否决）
+//   blocked  → 等依赖，不是失败；依赖关闭后流水线自动接手
+//   pr_open  → 已在进行中，无需重试
+//   无记录    → 从未被处理过，无需重试
+// 纯函数：必须返回新对象，绝不修改入参（validate 会断言）。
+export const RETRYABLE_STATUSES = ['needs_human', 'failed'];
+
+/** Reset a terminal `needs_human`/`failed` entry so the loop can resume it. */
+export function retryReset(prev) {
+  if (!prev || typeof prev !== 'object') {
+    return { ok: false, reason: '无状态记录（该 issue 从未被流水线处理过）' };
+  }
+  const status = String(prev.status || '');
+  if (status === 'merged') return { ok: false, reason: '已合并（不可逆，不能重试）' };
+  if (status === 'rejected') return { ok: false, reason: '已被 /reject 否决（否决优先；如需恢复请先 /approve 解除）' };
+  if (status === 'blocked') return { ok: false, reason: '等待依赖中（不是失败；依赖关闭后流水线会自动接手）' };
+  if (status === 'pr_open') return { ok: false, reason: 'PR 已在进行中（无需重试）' };
+  if (!RETRYABLE_STATUSES.includes(status)) {
+    return { ok: false, reason: `状态 ${status || '(空)'} 不在可重试范围（只有 ${RETRYABLE_STATUSES.join(' / ')} 可重试）` };
+  }
+  const next = { ...prev };
+  // 有 PR → 从审查/测试继续；没有 PR → 必须回到 `new`，否则实现入口不会触发（见 pipeline）。
+  next.status = prev.pr ? 'pr_open' : 'new';
+  next.retries = (Number(prev.retries) || 0) + 1;
+  next.retriedAt = new Date().toISOString();
+  next.previousStatus = status;
+  if (prev.error !== undefined) {
+    next.lastError = prev.error;   // 保留证据：上一次失败的原因
+    delete next.error;             // 但当前状态不再是「失败中」
+  }
+  return { ok: true, next };
+}
+
+/** Human-readable one-liner per stuck entry (for `pipeline.mjs retry --list`). */
+export function formatRetryList(state = {}) {
+  const lines = [];
+  for (const key of Object.keys(state || {})) {
+    const prev = state[key];
+    if (!prev || !RETRYABLE_STATUSES.includes(String(prev.status || ''))) continue;
+    const num = Number(key);
+    const err = prev.error === undefined || prev.error === null || prev.error === ''
+      ? '-'
+      : String(prev.error).replace(/\s+/g, ' ').slice(0, 120);
+    lines.push({ n: Number.isFinite(num) ? num : Infinity, text: `#${key} ${prev.status} pr=${prev.pr ?? '-'} retries=${prev.retries || 0} error=${err}` });
+  }
+  return lines.sort((a, b) => a.n - b.n).map(l => l.text);
+}
+
 // Prepare the branch Agent A implements on.
 // FIRST round: branch off `origin/<base>`. FIX round: the PR branch already
 // exists upstream, so we MUST continue on it — `git checkout -B <branch>
