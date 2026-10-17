@@ -3,7 +3,7 @@
 // Checks: syntax of all mjs/sh, SKILL.md frontmatter, template completeness,
 // doctor self-check, and that the live .agent/ copies match templates/ (no drift).
 import { execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, mkdtempSync, rmSync, copyFileSync, chmodSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -490,6 +490,212 @@ let doctorHumanOut = '';
     const undef = [...called].filter(n => !defined.has(n) && !globals.has(n) && !['if','for','while','switch','catch','return','typeof','function'].includes(n));
     if (undef.length) fail('workflow script references undefined helper(s): ' + undef.join(', '));
     else ok('workflow script helpers defined');
+  }
+}
+
+// 16. 终态必须可撤销：needs_human/failed 的人工恢复入口（issue #19）
+//     现实：#14 合并已成功却永久停在 needs_human，上游 #18 因 `gh pr create` 失败
+//     卡在 needs_human；两类都死胡同，唯一逃生口是未文档化且**会绕过 /reject**
+//     的 `run --force`。修法 = 纯确定性的 `retry` 子命令：显式人工动作、可审计
+//     （retries/lastError/日志/issue 评论）、且绝不绕过否决。
+{
+  const problems = [];
+
+  // 16a. retryReset 全分支（纯函数：不得修改入参）
+  if (typeof lib.retryReset !== 'function') fail('templates/lib.mjs 缺少 retryReset()');
+  else {
+    const nh = { status: 'needs_human', pr: 15, branch: 'agent/14', round: 2, fixes: 1, error: 'merge result unknown', title: 't' };
+    const r = lib.retryReset(nh);
+    if (!r?.ok) problems.push(`needs_human(有 PR) 应可重试，实得 ${JSON.stringify(r)}`);
+    else {
+      const n = r.next;
+      if (n.status !== 'pr_open') problems.push(`needs_human(有 PR) → status 期望 pr_open 实得 ${n.status}`);
+      for (const [k, v] of [['pr', 15], ['branch', 'agent/14'], ['round', 2], ['fixes', 1], ['title', 't']]) {
+        if (n[k] !== v) problems.push(`retryReset 丢失字段 ${k}（期望 ${JSON.stringify(v)} 实得 ${JSON.stringify(n[k])}）`);
+      }
+      if (n.retries !== 1) problems.push(`retries 期望 1 实得 ${JSON.stringify(n.retries)}`);
+      if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(String(n.retriedAt))) problems.push(`retriedAt 不是 ISO 时间: ${n.retriedAt}`);
+      if (n.previousStatus !== 'needs_human') problems.push(`previousStatus 期望 needs_human 实得 ${n.previousStatus}`);
+      if ('error' in n) problems.push(`error 未清空（应为 undefined）: ${JSON.stringify(n.error)}`);
+      if (n.lastError !== 'merge result unknown') problems.push(`旧 error 未移入 lastError: ${JSON.stringify(n.lastError)}`);
+    }
+    if (nh.status !== 'needs_human' || 'retries' in nh) problems.push('retryReset 修改了入参（必须是纯函数）');
+
+    const two = lib.retryReset({ status: 'failed', pr: 7, fixes: 2 });
+    if (!two?.ok) problems.push(`failed 应可重试，实得 ${JSON.stringify(two)}`);
+    else {
+      if (two.next.status !== 'pr_open') problems.push(`failed(有 PR) → status 期望 pr_open 实得 ${two.next.status}`);
+      if (two.next.fixes !== 2) problems.push(`failed 重试丢失 fixes: ${JSON.stringify(two.next)}`);
+      if ('lastError' in two.next) problems.push('无 error 时不应凭空生成 lastError');
+    }
+
+    // 无 PR 的 needs_human → `new`（实现入口必须接受 new，否则永久卡在 waiting_pr）
+    const noPr = lib.retryReset({ status: 'needs_human', error: 'gh pr create failed: must be a collaborator' });
+    if (!noPr?.ok) problems.push(`needs_human(无 PR) 应可重试，实得 ${JSON.stringify(noPr)}`);
+    else {
+      if (noPr.next.status !== 'new') problems.push(`needs_human(无 PR) → status 期望 new 实得 ${noPr.next.status}`);
+      if (noPr.next.lastError !== 'gh pr create failed: must be a collaborator') problems.push('无 PR 分支未保留 lastError');
+    }
+
+    // 累加计数（第 N 次重试）
+    const again = lib.retryReset({ status: 'failed', pr: 1, retries: 4 });
+    if (again?.next?.retries !== 5) problems.push(`retries 累加期望 5 实得 ${JSON.stringify(again?.next?.retries)}`);
+
+    // 拒绝分支：merged / rejected / blocked / pr_open / 无记录 → ok:false, reason 非空, 无 next
+    const rejects = [['merged', { status: 'merged', pr: 3 }], ['rejected', { status: 'rejected', pr: 3 }],
+      ['blocked', { status: 'blocked' }], ['pr_open', { status: 'pr_open', pr: 3 }], ['无记录', undefined], ['空对象', {}]];
+    for (const [label, prev] of rejects) {
+      let x;
+      try { x = lib.retryReset(prev); } catch (e) { problems.push(`retryReset(${label}) 抛错: ${e.message}`); continue; }
+      if (x?.ok !== false) problems.push(`retryReset(${label}) 期望 ok:false 实得 ${JSON.stringify(x)}`);
+      if (x && 'next' in x) problems.push(`retryReset(${label}) 拒绝时不得返回 next`);
+      if (typeof x?.reason !== 'string' || !x.reason) problems.push(`retryReset(${label}) 拒绝时必须给出 reason`);
+    }
+
+    // 重试后的状态必须仍被 watch 取活（不是终态），且 needs_human 仍被跳过（回归）
+    const issues = [{ number: 9, labels: ['agent-approved'] }];
+    for (const st of ['new', 'pr_open']) {
+      const got = lib.selectPendingIssues(issues, { 9: { status: st } }).map(i => i.number);
+      if (JSON.stringify(got) !== '[9]') problems.push(`selectPendingIssues(${st}) 应包含 #9 实得 ${JSON.stringify(got)}`);
+    }
+    const stillSkipped = lib.selectPendingIssues(issues, { 9: { status: 'needs_human' } }).map(i => i.number);
+    if (stillSkipped.length) problems.push('needs_human 仍应被 watch 跳过（重试是人工动作，不是自动循环）');
+
+    problems.length ? fail(`retryReset: ${problems.join('; ')}`) : ok('retryReset: needs_human/failed → pr_open|new（保留 pr/round/fixes，retries+1，error→lastError）；merged/rejected/blocked/pr_open/无记录 一律拒绝');
+  }
+
+  // 16b. formatRetryList 只列 needs_human/failed（「哪些卡住了」可发现）
+  if (typeof lib.formatRetryList !== 'function') fail('templates/lib.mjs 缺少 formatRetryList()');
+  else {
+    const lines = lib.formatRetryList({
+      12: { status: 'needs_human', pr: 15, error: 'merge result\nunknown' },
+      7: { status: 'failed', pr: null },
+      3: { status: 'merged', pr: 4 },
+      4: { status: 'pr_open', pr: 5 },
+    });
+    const text = lines.join('\n');
+    const miss = [];
+    if (!/#12 needs_human pr=15 retries=0 error=merge result unknown/.test(text)) miss.push('needs_human 行格式');
+    if (!/#7 failed pr=- retries=0 error=-/.test(text)) miss.push('failed 行格式（多行 error 需压平）');
+    if (/#3\b/.test(text) || /#4\b/.test(text)) miss.push('merged/pr_open 不应出现在列表');
+    // 按 issue 号排序，便于人工扫
+    if (lines.length !== 2 || !lines[0].startsWith('#7') || !lines[1].startsWith('#12')) miss.push(`排序/条数异常: ${JSON.stringify(lines)}`);
+    if (lib.formatRetryList({}).length !== 0) miss.push('空状态应返回空列表');
+    miss.length ? fail(`formatRetryList: ${miss.join('; ')}`) : ok('formatRetryList: 只列 needs_human/failed（按 issue 号排序，error 压平）');
+  }
+
+  // 16c. pipeline 的 retry 分支：走纯函数、否决优先、拒绝即 exit 2、绝不 force
+  {
+    const pipe = readFileSync(path.join(ROOT, 'templates/pipeline.mjs'), 'utf8');
+    const blk = pipe.split("cmd === 'retry'")[1]?.split("cmd === 'review'")[0] || '';
+    const miss = [];
+    if (!blk) miss.push("缺少 retry 子命令分支");
+    if (!/retryReset\(/.test(blk)) miss.push('未走 retryReset()');
+    if (!/isRejectedIssue\(/.test(blk)) miss.push('未检查 agent-rejected 标签');
+    if (!/process\.exit\(2\)/.test(blk)) miss.push('拒绝时未 exit 2');
+    if (!/--list/.test(blk) || !/formatRetryList\(/.test(blk)) miss.push('缺少 --list');
+    // 只允许「注释里提到 force」；代码里出现 force 参数/变量即视为绕过否决的隐患
+    const blkCode = blk.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' ');
+    if (/\bforce\b/.test(blkCode)) miss.push('retry 分支代码里出现 force（会绕过 /reject）');
+    const iReset = blk.indexOf('retryReset(');
+    const iVeto = blk.indexOf('isRejectedIssue(');
+    const iSave = blk.indexOf('state.save(');
+    if (iSave === -1) miss.push('未写 state.json');
+    else if (iReset === -1 || iReset > iSave) miss.push('可重试判定必须在写状态之前');
+    else if (iVeto === -1 || iVeto > iSave) miss.push('/reject 检查必须在写状态之前（先否决，后复位）');
+    // 无 PR 的复位目标是 `new` —— 实现入口必须接受它
+    if (!/cur\.status === 'new'/.test(pipe)) miss.push("实现入口未接受 status 'new'（重试会永久卡在 waiting_pr）");
+    miss.length ? fail(`pipeline retry 子命令: ${miss.join('; ')}`) : ok('pipeline retry: 纯函数判定 + 先查 /reject 再写状态 + 拒绝即 exit 2 + 无 force');
+
+    const pkg = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+    if (pkg.scripts?.['agent:retry'] === 'node .agent/pipeline.mjs retry') ok('package.json 提供 npm run agent:retry');
+    else fail(`package.json 缺少 "agent:retry": "node .agent/pipeline.mjs retry"（实得 ${JSON.stringify(pkg.scripts?.['agent:retry'])}）`);
+  }
+
+  // 16d. CLI 端到端：在 mkdtemp 里跑**真实** pipeline.mjs（STATE_FILE 由文件位置推导，
+  //      天然指向临时目录）+ 假 `gh`（离线、无副作用、不打真评论）。
+  {
+    const mkHarness = (stateObj, labelsJson) => {
+      const tmp = mkdtempSync(path.join(os.tmpdir(), 'agent-retry-'));
+      mkdirSync(path.join(tmp, '.agent'), { recursive: true });
+      copyFileSync(path.join(ROOT, 'templates/pipeline.mjs'), path.join(tmp, '.agent/pipeline.mjs'));
+      copyFileSync(path.join(ROOT, 'templates/lib.mjs'), path.join(tmp, '.agent/lib.mjs'));
+      writeFileSync(path.join(tmp, '.agent/state.json'), JSON.stringify(stateObj, null, 2));
+      const bin = path.join(tmp, 'bin');
+      mkdirSync(bin, { recursive: true });
+      const ghPath = path.join(bin, 'gh');
+      writeFileSync(ghPath, "#!/usr/bin/env node\nconst a = process.argv.slice(2);\nif (a[0] === 'issue' && (a[1] === 'view' || a[1] === 'comment')) { if (a[1] === 'view') process.stdout.write(process.env.FAKE_GH_ISSUE || '{\\\"labels\\\":[]}'); process.exit(0); }\nprocess.exit(1);\n");
+      chmodSync(ghPath, 0o755);
+      return tmp;
+    };
+    const runRetry = (tmp, args, labelsJson) => {
+      try {
+        const out = execFileSync('node', [path.join(tmp, '.agent/pipeline.mjs'), 'retry', ...args], {
+          cwd: tmp, encoding: 'utf8', stdio: 'pipe',
+          env: { ...process.env, PATH: path.join(tmp, 'bin') + path.delimiter + (process.env.PATH || ''), FAKE_GH_ISSUE: labelsJson || '{"labels":[]}' },
+        });
+        return { code: 0, out };
+      } catch (e) {
+        return { code: e.status, out: String(e.stdout || ''), err: String(e.stderr || '') };
+      }
+    };
+    const tidies = [];
+    try {
+      // (1) merged → exit 2，且 state.json 字节级不变
+      const sMerged = { 3: { status: 'merged', pr: 9, round: 1 } };
+      const t1 = mkHarness(sMerged); tidies.push(t1);
+      const before = readFileSync(path.join(t1, '.agent/state.json'), 'utf8');
+      const r1 = runRetry(t1, ['--issue', '3']);
+      const after = readFileSync(path.join(t1, '.agent/state.json'), 'utf8');
+      if (r1.code !== 2) fail(`retry --issue <merged> 应 exit 2，实得 ${r1.code}`);
+      else if (before !== after) fail('retry 拒绝时修改了 state.json（必须字节级不变）');
+      else ok('retry --issue <merged>: exit 2 + state.json 字节级不变');
+
+      // (2) 带 agent-rejected 标签 → exit 2，不写状态
+      const t2 = mkHarness({ 5: { status: 'needs_human', pr: 8 } }); tidies.push(t2);
+      const b2 = readFileSync(path.join(t2, '.agent/state.json'), 'utf8');
+      const r2 = runRetry(t2, ['--issue', '5'], '{"labels":[{"name":"agent-approved"},{"name":"agent-rejected"}]}');
+      const a2 = readFileSync(path.join(t2, '.agent/state.json'), 'utf8');
+      if (r2.code !== 2) fail(`retry 带 agent-rejected 标签应 exit 2，实得 ${r2.code}`);
+      else if (b2 !== a2) fail('retry 检测到 /reject 后仍写了 state.json');
+      else ok('retry 带 agent-rejected 标签: exit 2 + 不写状态（绝不绕过否决）');
+
+      // (3) needs_human（有 PR）→ 成功复位：pr_open，pr/round/fixes 原值保留，error→lastError
+      const t3 = mkHarness({ 7: { status: 'needs_human', pr: 15, branch: 'agent/7', round: 2, fixes: 1, error: 'merge result unknown', title: 'x' } });
+      tidies.push(t3);
+      const r3 = runRetry(t3, ['--issue', '7']);
+      const st3 = JSON.parse(readFileSync(path.join(t3, '.agent/state.json'), 'utf8'))['7'];
+      const bad3 = [];
+      if (r3.code !== 0) bad3.push(`exit ${r3.code}: ${r3.err}`);
+      if (st3.status !== 'pr_open') bad3.push(`status=${st3.status}`);
+      for (const [k, v] of [['pr', 15], ['branch', 'agent/7'], ['round', 2], ['fixes', 1], ['title', 'x']]) if (st3[k] !== v) bad3.push(`${k}=${JSON.stringify(st3[k])}`);
+      if (st3.retries !== 1) bad3.push(`retries=${st3.retries}`);
+      if (st3.lastError !== 'merge result unknown') bad3.push(`lastError=${JSON.stringify(st3.lastError)}`);
+      if ('error' in st3) bad3.push('error 未清空');
+      if (!existsSync(path.join(t3, '.agent/logs/issue-7.md'))) bad3.push('未写 .agent/logs/issue-7.md（审计缺失）');
+      bad3.length ? fail(`retry --issue <needs_human>: ${bad3.join('; ')}`) : ok('retry --issue <needs_human>: pr_open + 保留 pr/branch/round/fixes + retries=1 + error→lastError + 写日志');
+
+      // (4) failed 且无 PR → `new`（否则永久卡在 waiting_pr），且接受裸 issue 号
+      const t4 = mkHarness({ 9: { status: 'failed', error: 'tests' } }); tidies.push(t4);
+      const r4 = runRetry(t4, ['9']);
+      const st4 = JSON.parse(readFileSync(path.join(t4, '.agent/state.json'), 'utf8'))['9'];
+      if (r4.code !== 0) fail(`retry 9（裸号）应 exit 0，实得 ${r4.code}: ${r4.err}`);
+      else if (st4.status !== 'new') fail(`retry failed(无 PR) → status 期望 new 实得 ${st4.status}`);
+      else ok('retry <裸号>: failed(无 PR) → new（实现入口会接手）');
+
+      // (5) --list 列出全部 needs_human/failed，不列 merged
+      const t5 = mkHarness({ 2: { status: 'needs_human', pr: 4, error: 'boom' }, 6: { status: 'failed' }, 8: { status: 'merged' } }); tidies.push(t5);
+      const r5 = runRetry(t5, ['--list']);
+      const out5 = r5.out || '';
+      if (r5.code !== 0) fail(`retry --list 应 exit 0，实得 ${r5.code}: ${r5.err}`);
+      else if (!out5.includes('#2 needs_human') || !out5.includes('#6 failed')) fail(`retry --list 未列出 needs_human/failed: ${out5.trim()}`);
+      else if (/#8\b/.test(out5)) fail('retry --list 不应列出 merged 条目');
+      else ok('retry --list: 列出全部 needs_human/failed（可发现），排除 merged');
+    } catch (e) {
+      fail(`retry CLI 端到端: ${e.message}`);
+    } finally {
+      for (const t of tidies) rmSync(t, { recursive: true, force: true });
+    }
   }
 }
 

@@ -13,7 +13,9 @@
 //  Usage:
 //    node .agent/pipeline.mjs watch                 # loop until idle (Ctrl-C)
 //    node .agent/pipeline.mjs watch --once          # one pass
-//    node .agent/pipeline.mjs run --issue 42        # force-run one issue
+//    node .agent/pipeline.mjs run --issue 42        # one issue, no --force needed for needs_human
+//    node .agent/pipeline.mjs retry --issue 42      # resume a needs_human/failed issue (never bypasses /reject)
+//    node .agent/pipeline.mjs retry --list          # list every stuck issue
 //    node .agent/pipeline.mjs test --issue 42       # run test agent only
 //    node .agent/pipeline.mjs status                # show state machine
 //
@@ -31,7 +33,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, copyFileSync, symlinkSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { classifyMergeAttempt, detectBase, isRejectedIssue, MERGE_BLOCKED, MERGE_MERGED, mergeIssueState, prepareImplementerBranch, resolvePi, resolveTesterCommands, selectPendingIssues, sh } from './lib.mjs';
+import { classifyMergeAttempt, detectBase, formatRetryList, isRejectedIssue, MERGE_BLOCKED, MERGE_MERGED, mergeIssueState, prepareImplementerBranch, REJECTED_LABEL, resolvePi, resolveTesterCommands, retryReset, selectPendingIssues, sh } from './lib.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const AGENT = path.join(ROOT, '.agent');
@@ -482,7 +484,9 @@ async function processIssueInner(issue, force = false) {
   }
 
   // 1) IMPLEMENT
-  if (!cur || (cur.status === 'pr_open' && (!pr || force))) {
+  // `new` 也必须进入实现：人工 `retry` 把「无 PR 的 needs_human/failed」复位成 `new`，
+  // 若实现入口仍只看 `pr_open`，条目会永久卡在 waiting_pr（issue #19）。
+  if (!cur || cur.status === 'new' || (cur.status === 'pr_open' && (!pr || force))) {
     if (pr && !force && cur) {
       s[issue.number] = { ...cur, status: 'reviewing' };
       state.save(s);
@@ -724,6 +728,82 @@ async function main() {
         : issue;
       await processIssue(typeof full === 'string' ? JSON.parse(full) : full, force);
     }
+    return;
+  }
+
+  if (cmd === 'retry') {
+    // ── 人工恢复入口（issue #19）──────────────────────────────────
+    // `needs_human` / `failed` 是失败终态，watch 循环故意跳过（重试必须是**显式
+    // 人工动作**，不是自动循环）。人类修好根因后用它从中断点继续，不必碰
+    // gitignored 的 state.json，也不必用会绕过 /reject 的 `--force`。
+    //   node .agent/pipeline.mjs retry --issue 42
+    //   node .agent/pipeline.mjs retry 42
+    //   node .agent/pipeline.mjs retry --list
+    const args = process.argv.slice(3);
+    if (args.includes('--list')) {
+      const lines = formatRetryList(state.load());
+      if (!lines.length) {
+        console.log('没有需要恢复的条目（needs_human / failed 均为空）。');
+        return;
+      }
+      console.log(`可恢复的条目（${lines.length}）：\n`);
+      for (const l of lines) console.log('  ' + l);
+      console.log('\n恢复某条：node .agent/pipeline.mjs retry --issue <N>');
+      return;
+    }
+    const iRetry = args.indexOf('--issue');
+    const raw = iRetry >= 0 ? args[iRetry + 1] : args.find(a => /^#?\d+$/.test(a));
+    const issueNum = String(raw ?? '').replace(/^#/, '');
+    if (!/^\d+$/.test(issueNum)) {
+      console.error('usage: pipeline.mjs retry --issue <number>   |   pipeline.mjs retry --list');
+      process.exit(2);
+    }
+    // 1) 状态是否可重试 —— 纯判定在任何 gh 调用之前（拒绝时不写状态、离线可测）
+    const reset = retryReset(state.load()[issueNum]);
+    if (!reset.ok) {
+      console.error(`✗ 拒绝重试 issue #${issueNum}：${reset.reason}`);
+      console.error('  .agent/state.json 未改动。');
+      process.exit(2);
+    }
+    // 2) 否决优先 —— 带 agent-rejected 标签的 issue 绝不重试。
+    //    取不到标签 = 无法确认否决状态 → fail-closed（同 finishMerge 的原则）。
+    let issueMeta;
+    try {
+      issueMeta = ghJson(['issue', 'view', issueNum, '--json', 'number,title,labels,state']);
+    } catch (e) {
+      console.error(`✗ 拒绝重试 issue #${issueNum}：无法确认 /reject 标签（${e.message}）`);
+      console.error('  为避免复活已被否决的 issue，本命令 fail-closed，不写状态。请先修复 gh 访问后重试。');
+      process.exit(2);
+    }
+    if (isRejectedIssue(issueMeta)) {
+      console.error(`✗ 拒绝重试 issue #${issueNum}：该 issue 带 ${REJECTED_LABEL} 标签（/reject 否决优先）。`);
+      console.error('  .agent/state.json 未改动。如需恢复，请先在 issue 下回复 /approve 解除否决。');
+      process.exit(2);
+    }
+    // 3) 写状态 + 审计（日志 + issue 评论）
+    const s = state.load();
+    s[issueNum] = mergeIssueState(s[issueNum], reset.next);
+    // mergeIssueState 只能覆盖、不能删键：旧 error 已存入 lastError，这里显式清空当前 error
+    delete s[issueNum].error;
+    state.save(s);
+    const st = s[issueNum];
+    const stage = st.status === 'pr_open'
+      ? `审查/测试（PR #${st.pr} 已存在）`
+      : '实现（无 PR，从头实现）';
+    log(issueNum, `人工重试 #${st.retries}：${st.previousStatus} → ${st.status}（从「${stage}」继续${st.lastError ? `；上次失败：${String(st.lastError).slice(0, 200)}` : ''}）`);
+    try {
+      commentOnIssue(issueNum, [
+        `🔁 **已由人工请求重试**（第 ${st.retries} 次）：\`${st.previousStatus}\` → \`${st.status}\``,
+        `将从「${stage}」继续。`,
+        st.lastError ? `上次失败原因（已存档）：\`${String(st.lastError).replace(/\n/g, ' ').slice(0, 400)}\`` : '',
+      ].filter(Boolean).join('\n\n'));
+    } catch (e) {
+      console.warn(`[retry] issue #${issueNum} 评论失败（状态已写入，不影响续跑）：${e.message}`);
+    }
+    console.log(`✓ issue #${issueNum} 已复位：${st.previousStatus} → ${st.status}（retries=${st.retries}，从「${stage}」继续）`);
+    console.log('下一步：');
+    console.log('  watcher 运行中 → 最多 1 个 tick（30s）内自动接手（tmux attach -t agent 可看）');
+    console.log('  watcher 未运行 → npm run agent:watch');
     return;
   }
 
