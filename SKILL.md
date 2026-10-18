@@ -230,6 +230,21 @@ pipeline 在开工前会检查这些前置 issue：**只要有未关闭的，就
    reviewer 提示词强制英文哨兵。
 6. `--dry-run` 不消耗配额；每个 issue 处理完自动切回原分支。
 
+## 出站正文的凭据防线（issue #21 · 真实事故 lessons #28）
+
+令牌一旦被推送就会被 GitHub secret scanning **自动吊销**（不可收回，之后所有 `gh` 401），
+所以必须在**发送前**拦住，并且覆盖**所有代码可控出口**（不是只加在几个调用点）：
+
+- **硬拦截**（`assertNoSecrets()`，throw 不发）= agent 自己撰写的正文：issue/PR 评论、
+  PR 正文、`gh pr review --body`。
+- **脱敏后发送**（`redactSecrets()`）= 必须留下审计记录的通道：上游 `[skill-feedback]`
+  （跨仓库）、筛选判定评论、`issue edit --body`、本地日志（`log()` 单点脱敏）。
+  命中时留痕“已自动脱敏 N 处”，人类能看出这里被处理过。
+- **结构性保证**：`npm test`（validate 7e）要求每个 `'--body'` 调用点都被
+  `assertNoSecrets(` / `redactSecrets(` 包裹；提示词文件不得再出现 `--body "` 示范
+  （正文一律先写文件再 `--body-file`）。新增出站点不包裹直接红。
+- **已知边界**：模型自己在 bash 里跑的 `gh` 调用属于代码不可控，只靠提示词约束。
+
 ## 自我提升协议（skill 的维护回路）
 
 - 安装时询问 opt-in（第二步.3），写入 `.agent/config.json`。

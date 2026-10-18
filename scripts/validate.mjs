@@ -107,7 +107,7 @@ for (const [t, live] of PAIRS) {
   }
 }
 
-// 7d) **下发前令牌特征拦截**必须存在且真的会拦（lessons #26：真令牌曾被 shell 展开
+// 7d) **下发前令牌特征拦截**必须存在且真的会拦（lessons #28：真令牌曾被 shell 展开
 // 贴进 PR 评论 → GitHub 自动吊销 → 全链路 401）。这里做功能测试，而不是只 grep 源码。
 {
   const url = 'file://' + path.join(ROOT, '.agent/pipeline.mjs').replace(/\\/g, '/');
@@ -127,6 +127,168 @@ for (const [t, live] of PAIRS) {
     else ok('assertNoSecrets blocks token shapes, passes normal text');
   } catch (e) {
     fail('assertNoSecrets 功能测试失败: ' + String((e.stderr || e.message) || '').split('\n').slice(0, 3).join(' '));
+  }
+
+  // 7d-2) `redactSecrets` 功能测试（issue #21）：脱敏后的文本**不含完整令牌**，
+  //        能被 assertNoSecrets 放行，幂等，只留 4 位前缀，正常文本零误报。
+  {
+    if (typeof lib.redactSecrets !== 'function') fail('templates/lib.mjs 缺少 redactSecrets()');
+    else {
+      const tok = ['gho_' + 'A1b2'.repeat(9), 'github_pat_' + 'Z9'.repeat(15), 'sk-' + 'q7'.repeat(12), 'AKIA' + 'Q1'.repeat(8), 'xoxb-' + '12'.repeat(8)];
+      const problems = [];
+      for (const t of tok) {
+        const line = `日志行/反馈正文里混进了凭据 ${t} 之后还有中文。`;
+        const red = lib.redactSecrets(line);
+        if (red.includes(t)) problems.push(`未脱敏 ${t.slice(0, 4)}…`);
+        if (lib.countSecretMatches(red) !== 0) problems.push(`脱敏结果仍命中令牌特征 ${t.slice(0, 4)}…`);
+        try { lib.assertNoSecrets(red); } catch (e) { problems.push(`assertNoSecrets(redactSecrets(x)) 未放行 ${t.slice(0, 4)}…: ${e.message}`); }
+        if (lib.redactSecrets(red) !== red) problems.push(`redactSecrets 不幂等 ${t.slice(0, 4)}…`);
+        // 只留 4 位前缀（足以辨认凭据类型），其余一律抹掉
+        const marker = red.match(/<redacted:[^>]*>/);
+        if (!marker) problems.push(`没有 <redacted:…> 标记 ${t.slice(0, 4)}…`);
+        else if (marker[0].length > '<redacted:'.length + 4 + 1) problems.push(`脱敏标记暴露超过 4 位前缀: ${marker[0]}`);
+        else if (!marker[0].startsWith(`<redacted:${t.slice(0, 4)}>`)) problems.push(`脱敏标记丢失类型前缀: ${marker[0]}`);
+      }
+      // 正常文本（中文 / URL / 形近单词）绝对不能误报
+      const normal = [
+        '普通正文，不含任何凭据。',
+        'https://github.com/azumag/IRLight/issues/468',
+        'task-oriented skill-oriented risk-oriented work',
+        'sk-learn 和 sk- 开头的短词不算令牌',
+        'gho_ 只是类型前缀，后面没有 16 位以上字符',
+      ];
+      for (const n of normal) {
+        if (lib.redactSecrets(n) !== n) problems.push(`正常文本被误改: ${n} → ${lib.redactSecrets(n)}`);
+        if (lib.countSecretMatches(n) !== 0) problems.push(`正常文本被误判为凭据: ${n}`);
+      }
+      // 多处命中都要脱敏，且计数正确
+      const multi = `a ${tok[0]} b ${tok[2]}`;
+      if (lib.countSecretMatches(multi) !== 2) problems.push(`countSecretMatches 多处命中计数错: ${lib.countSecretMatches(multi)}`);
+      if (lib.countSecretMatches(lib.redactSecrets(multi)) !== 0) problems.push('多处命中未全部脱敏');
+      problems.length
+        ? fail(`redactSecrets: ${problems.join('; ')}`)
+        : ok('redactSecrets: 脱敏后不含完整令牌 + assertNoSecrets 放行 + 幂等 + 只留 4 位前缀 + 正常文本零误报');
+    }
+  }
+}
+
+// 7e) **结构性 lint**：出站正文的防线不能靠「记得在三个地方加」（issue #21）。
+//     每个 `'--body'` 调用点都必须在**同一行**出现 assertNoSecrets( 或 redactSecrets(，
+//     新增调用点不包裹 → 这里直接红。规则二分：agent 自己撰写的正文硬拦截，
+//     「必须留下审计记录」的通道（筛选判定 / issue 正文 / 上游 feedback / 日志）脱敏后发送。
+const BODY_WRAPPERS = ['assertNoSecrets(', 'redactSecrets('];
+const lintBodyCallSites = (src) => {
+  const bad = [];
+  String(src).split('\n').forEach((line, i) => {
+    if (!/'--body'/.test(line)) return;
+    if (!BODY_WRAPPERS.some(w => line.includes(w))) bad.push(i + 1);
+  });
+  return bad;
+};
+{
+  const problems = [];
+  // 破坏性自检：lint 自身必须能抓到裸调用（否则「绿」毫无意义）
+  const synthetic = "gh(['issue', 'comment', '1', '--body', body]);\n";
+  if (lintBodyCallSites(synthetic).length !== 1) problems.push('lint 自检失败：裸 `\'--body\'` 未被判定为违规');
+  const syntheticOk = "gh(['issue', 'comment', '1', '--body', assertNoSecrets(body)]);\ngh(['issue', 'edit', '1', '--body', redactSecrets(b)]);\n";
+  if (lintBodyCallSites(syntheticOk).length !== 0) problems.push('lint 自检失败：已包裹的调用被误报');
+
+  for (const f of ['templates/pipeline.mjs', 'templates/pm/screen.mjs']) {
+    const bad = lintBodyCallSites(readFileSync(path.join(ROOT, f), 'utf8'));
+    if (bad.length) problems.push(`${f} 的 '--body' 调用点未包裹凭据防线（行 ${bad.join(',')}）`);
+  }
+  // 提示词的示范不得教事故写法（7b 只 grep 存在 --body-file，矛盾示范能长期存活）
+  for (const dir of ['templates/prompts', 'templates/pm']) {
+    for (const f of readdirSync(path.join(ROOT, dir)).filter(n => n.endsWith('.md'))) {
+      const t = readFileSync(path.join(ROOT, dir, f), 'utf8');
+      if (t.includes('--body "')) problems.push(`${dir}/${f} 仍含 \`--body "\` 事故写法（必须改 --body-file）`);
+    }
+  }
+  problems.length ? fail(`出站正文 lint (7e): ${problems.join('; ')}`) : ok("出站正文 lint (7e): 每个 '--body' 调用点都被 assertNoSecrets/redactSecrets 包裹；提示词无 `--body \"` 示范");
+}
+
+// 7f) **离线端到端**：脱敏不只是纯函数。用假 `gh` 跑真实 pipeline（mkdir 临时仓）。
+//     (1) `feedback` 子命令 → 上游 issue 的 title/body 均无完整令牌，且带上「已脱敏 N 处」
+//     (2) `retry --issue N` → 落盘日志 .agent/logs/issue-N.md 无完整令牌
+{
+  const TOK = 'gho_' + 'S3cr3t'.repeat(6);
+  const mkHarness = (stateObj) => {
+    const tmp = mkdtempSync(path.join(os.tmpdir(), 'agent-redact-'));
+    mkdirSync(path.join(tmp, '.agent'), { recursive: true });
+    copyFileSync(path.join(ROOT, 'templates/pipeline.mjs'), path.join(tmp, '.agent/pipeline.mjs'));
+    copyFileSync(path.join(ROOT, 'templates/lib.mjs'), path.join(tmp, '.agent/lib.mjs'));
+    writeFileSync(path.join(tmp, '.agent/state.json'), JSON.stringify(stateObj, null, 2));
+    writeFileSync(path.join(tmp, '.agent/config.json'), JSON.stringify({ upstream: 'acme/agent-dev-team', feedbackOptIn: true }, null, 2));
+    const bin = path.join(tmp, 'bin');
+    mkdirSync(bin, { recursive: true });
+    const logFile = path.join(tmp, 'gh-calls.log');
+    writeFileSync(logFile, '');
+    const ghPath = path.join(bin, 'gh');
+    writeFileSync(ghPath, [
+      '#!/usr/bin/env node',
+      "const a = process.argv.slice(2);",
+      "const fs = require('node:fs');",
+      "const log = (p) => { if (process.env.FAKE_GH_LOG) fs.appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify(p) + '\\n'); };",
+      "if (a[0] === 'issue' && a[1] === 'list') { log(a); process.stdout.write('[]'); process.exit(0); }",
+      "if (a[0] === 'issue' && a[1] === 'create') { log(a); process.exit(0); }",
+      "if (a[0] === 'issue' && a[1] === 'comment') { log(a); process.exit(0); }",
+      "if (a[0] === 'issue' && a[1] === 'view') { process.stdout.write(process.env.FAKE_GH_ISSUE || '{\"labels\":[]}'); process.exit(0); }",
+      'process.exit(1);',
+      '',
+    ].join('\n'));
+    chmodSync(ghPath, 0o755);
+    return { tmp, logFile };
+  };
+  const run = (h, args) => {
+    try {
+      const out = execFileSync('node', [path.join(h.tmp, '.agent/pipeline.mjs'), ...args], {
+        cwd: h.tmp, encoding: 'utf8', stdio: 'pipe',
+        env: { ...process.env, PATH: path.join(h.tmp, 'bin') + path.delimiter + (process.env.PATH || ''), FAKE_GH_LOG: h.logFile },
+      });
+      return { code: 0, out };
+    } catch (e) { return { code: e.status, out: String(e.stdout || ''), err: String(e.stderr || '') }; }
+  };
+  const tidies = [];
+  try {
+    // (1) 上游 feedback：跨仓库出站点，必须先脱敏再发
+    const h1 = mkHarness({}); tidies.push(h1.tmp);
+    const r1 = run(h1, ['feedback', `push 失败 ${TOK}`, `远端报错: remote https://x-access-token:${TOK}@github.com refused\n${'x'.repeat(10)}`]);
+    const calls = readFileSync(h1.logFile, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+    const creates = calls.filter(a => a[0] === 'issue' && a[1] === 'create');
+    const problems = [];
+    if (r1.code !== 0) problems.push(`feedback 子命令 exit ${r1.code}: ${r1.err}`);
+    if (!creates.length) problems.push('没有调用 issue create（reportGap 未执行）');
+    for (const a of creates) {
+      const joined = a.join(' ');
+      if (joined.includes(TOK)) problems.push('上游 feedback 正文/标题含完整令牌（跨仓库公开泄漏）');
+      if (!joined.includes('<redacted:')) problems.push('上游 feedback 未见脱敏标记（无法确认脱敏生效）');
+      const bodyArg = a[a.indexOf('--body') + 1] || '';
+      const titleArg = a[a.indexOf('--title') + 1] || '';
+      if (!/已自动脱敏 \d+ 处疑似凭据/.test(bodyArg)) problems.push('脱敏命中时正文未附「已自动脱敏 N 处」审计行');
+      if (!/^\[skill-feedback\]/.test(titleArg)) problems.push('title 前缀被破坏: ' + titleArg);
+    }
+    problems.length ? fail(`reportGap 脱敏 (7f-1): ${problems.join('; ')}`)
+      : ok('reportGap 脱敏 (7f-1): 上游 issue 的 title/body 均无完整令牌，且正文附「已自动脱敏 N 处」');
+
+    // (2) 日志落盘也必须脱敏（人类排障会把日志贴进 issue）
+    const h2 = mkHarness({ 7: { status: 'needs_human', pr: 5, error: `push failed for https://${TOK}@github.com/acme/x` } });
+    tidies.push(h2.tmp);
+    const r2 = run(h2, ['retry', '--issue', '7']);
+    const logPath = path.join(h2.tmp, '.agent/logs/issue-7.md');
+    const bad2 = [];
+    if (r2.code !== 0) bad2.push(`retry exit ${r2.code}: ${r2.err}`);
+    if (!existsSync(logPath)) bad2.push('未写 .agent/logs/issue-7.md');
+    else {
+      const text = readFileSync(logPath, 'utf8');
+      if (text.includes(TOK)) bad2.push('.agent/logs/issue-N.md 含完整令牌（日志是出站点）');
+      if (!text.includes('<redacted:')) bad2.push('日志未见脱敏标记');
+      if (!/已脱敏 \d+ 处/.test(text)) bad2.push('日志未注明已脱敏处数');
+    }
+    bad2.length ? fail(`日志脱敏 (7f-2): ${bad2.join('; ')}`) : ok('日志脱敏 (7f-2): .agent/logs/issue-N.md 无完整令牌 + 留下脱敏痕迹');
+  } catch (e) {
+    fail(`脱敏端到端 (7f): ${e.message}`);
+  } finally {
+    for (const t of tidies) rmSync(t, { recursive: true, force: true });
   }
 }
 

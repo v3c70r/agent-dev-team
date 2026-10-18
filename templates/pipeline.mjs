@@ -33,7 +33,9 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, copyFileSync, symlinkSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { classifyMergeAttempt, detectBase, formatRetryList, isRejectedIssue, MERGE_BLOCKED, MERGE_MERGED, mergeIssueState, prepareImplementerBranch, REJECTED_LABEL, resolvePi, resolveTesterCommands, retryReset, selectPendingIssues, sh } from './lib.mjs';
+// 出站凭据防线（SECRET_PATTERNS / assertNoSecrets / redactSecrets / countSecretMatches）
+// 现在只有一份实现，住在 lib.mjs（pipeline 与 pm/screen.mjs 共用）。见 docs/lessons.md #28。
+import { assertNoSecrets, classifyMergeAttempt, countSecretMatches, detectBase, formatRetryList, isRejectedIssue, MERGE_BLOCKED, MERGE_MERGED, mergeIssueState, prepareImplementerBranch, redactSecrets, REJECTED_LABEL, resolvePi, resolveTesterCommands, retryReset, SECRET_PATTERNS, selectPendingIssues, sh } from './lib.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const AGENT = path.join(ROOT, '.agent');
@@ -73,6 +75,10 @@ function openDependencies(issue) {
 function loadConfig() {
   try { return JSON.parse(readFileSync(path.join(AGENT, 'config.json'), 'utf8')); } catch { return {}; }
 }
+// 上游 feedback 通道（issue #21）：这是**跨仓库**出站点（发到第三方 cfg.upstream），
+// 一旦带上凭据就是公开泄漏且无法收回（只能吊销）。所以这里是**脱敏后发送**，
+// 不是硬拦截 —— feedback 是自我改进的输入，丢掉它就丢掉发现问题的能力。
+// 脱敏命中时在正文末尾留一行可审计的提示，人类能看出「这里被处理过」。
 function reportGap(title, body) {
   const cfg = loadConfig();
   if (!cfg.feedbackOptIn || !cfg.upstream) return;
@@ -82,15 +88,18 @@ function reportGap(title, body) {
     const recent = ghJson(['issue', 'list', '-R', cfg.upstream, '--state', 'all',
       '--search', `[skill-feedback] created:>=${since}`, '--limit', '10', '--json', 'number']);
     if (recent.length >= 3) { console.warn('[feedback] daily cap reached, skip'); return; }
-    const full = `${body}\n\n---\n_自动反馈来自 agent-dev-team 流水线（opt-in）。不应包含用户代码；如包含请维护者删除。 ${new Date().toISOString()}_`;
+    const hidden = countSecretMatches(title) + countSecretMatches(body);
+    const redactNote = hidden ? `\n\n> 🔒 已自动脱敏 ${hidden} 处疑似凭据（不含完整令牌）。` : '';
+    const full = `${redactSecrets(body)}${redactNote}\n\n---\n_自动反馈来自 agent-dev-team 流水线（opt-in）。不应包含用户代码；如包含请维护者删除。 ${new Date().toISOString()}_`;
+    const safeTitle = redactSecrets(title);
     try {
-      gh(['issue', 'create', '-R', cfg.upstream, '--label', 'skill-feedback', '--title', `[skill-feedback] ${title}`, '--body', full]);
+      gh(['issue', 'create', '-R', cfg.upstream, '--label', 'skill-feedback', '--title', `[skill-feedback] ${safeTitle}`, '--body', redactSecrets(full)]);
     } catch {
       // most users lack label rights upstream — retry without label
-      gh(['issue', 'create', '-R', cfg.upstream, '--title', `[skill-feedback] ${title}`, '--body', full]);
+      gh(['issue', 'create', '-R', cfg.upstream, '--title', `[skill-feedback] ${safeTitle}`, '--body', redactSecrets(full)]);
     }
-    console.warn(`[feedback] filed upstream: [skill-feedback] ${title}`);
-  } catch (e) { console.warn('[feedback] failed:', e.message); }
+    console.warn(`[feedback] filed upstream: [skill-feedback] ${safeTitle}`);
+  } catch (e) { console.warn('[feedback] failed:', redactSecrets(e.message)); }
 }
 
 // ── tiny helpers ──
@@ -148,37 +157,23 @@ const state = {
   },
   save(s) { writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); },
 };
+// 日志也是出站点（issue #21）：`log()` 原样落盘 pi/模型输出与异常栈，人类排障时
+// 会把日志贴进 issue（lessons #25 的评论损坏事故就是「内容贴来贴去」）。
+// 在这一处收口 → 覆盖 pi 输出、review 输出、retry 日志、循环异常栈等所有日志路径。
+// 日志是**必须保留**的审计证据，所以这里是脱敏而不是拦截。
 function log(issueNum, msg) {
   mkdirSync(LOG_DIR, { recursive: true });
   const f = path.join(LOG_DIR, `issue-${issueNum}.md`);
-  writeFileSync(f, (existsSync(f) ? readFileSync(f, 'utf8') : '') + `\n[${new Date().toISOString()}] ${msg}\n`);
+  const raw = String(msg ?? '');
+  const hidden = countSecretMatches(raw);
+  const safe = redactSecrets(raw) + (hidden ? `\n[_已脱敏 ${hidden} 处疑似凭据_]` : '');
+  writeFileSync(f, (existsSync(f) ? readFileSync(f, 'utf8') : '') + `\n[${new Date().toISOString()}] ${safe}\n`);
 }
-// ── 下发前置防线：任何 GitHub 正文在发出前扫描令牌特征 ──
-// 2026-10-16 真实事故：评论正文里的 `$(gh auth token --user <owner>)` 被 shell
-// 展开成**真令牌**并贴进 PR 评论 → GitHub 秘密扫描自动吊销 → 全链路 401，
-// 流水线卡死。提示词里写了禁令也可能被绕过，所以必须在**代码层**硬拦：
-// 一旦命中特征就拒绝发送（throw），宁可不发评论也不泄漏凭据（lessons #26）。
-const SECRET_PATTERNS = [
-  /\bgh[pousr]_[A-Za-z0-9]{16,}\b/,        // GitHub OAuth / PAT / user / server token
-  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/,      // fine-grained PAT
-  /\bglpat-[A-Za-z0-9_-]{16,}\b/,          // GitLab
-  /\bsk-[A-Za-z0-9_-]{16,}\b/,             // OpenAI-style secret key
-  /\bAKIA[0-9A-Z]{16}\b/,                  // AWS access key id
-  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/,      // Slack
-];
-function assertNoSecrets(text, where = 'GitHub 正文') {
-  const str = String(text ?? '');
-  for (const re of SECRET_PATTERNS) {
-    const m = str.match(re);
-    if (m) {
-      // 报错里只暴露前 6 位，避免把泄漏内容再写进日志/工单
-      throw new Error(
-        `拒绝发送 ${where}：正文中含疑似凭据（${m[0].slice(0, 6)}…，len=${m[0].length}）。` +
-        '这是硬拦截，请移除凭据后重试（docs/lessons.md #26）');
-    }
-  }
-  return str;
-}
+// ── 下发前置防线：agent 自己撰写的 GitHub 正文在发出前硬拦截令牌特征 ──
+// 2026-10-16 真实事故（c36aca5）：评论正文里的 `$(gh auth token --user <owner>)` 被
+// shell 展开成**真令牌**并贴进 PR 评论 → GitHub 秘密扫描自动吊销 → 全链路 401。
+// 提示词里写了禁令也可能被绕过，所以必须在**代码层**硬拦：一旦命中特征就拒绝发送
+// （throw），宁可不发评论也不泄漏凭据。实现已移入 lib.mjs（与 pm/screen.mjs 共用）。
 function commentOnIssue(num, body) { gh(['issue', 'comment', String(num), '--body', assertNoSecrets(body, `issue #${num} 评论`)]); }
 function commentOnPr(num, body) { gh(['pr', 'comment', String(num), '--body', assertNoSecrets(body, `PR #${num} 评论`)]); }
 
@@ -593,7 +588,7 @@ async function finishMerge(issueNum, prNum) {
   let approvalNote = '';
   if (reviewerGhUser()) {
     try {
-      gh(['pr', 'review', String(prNum), '--approve', '--body', approveBody], { env: reviewerEnv() });
+      gh(['pr', 'review', String(prNum), '--approve', '--body', assertNoSecrets(approveBody, `PR #${prNum} review 正文`)], { env: reviewerEnv() });
       const counts = reviewerCanCountApproval();
       approvalNote = counts === true
         ? `批准由独立账号 **${reviewerGhUser()}** 提交（该账号有写权限，可计入分支保护的 required reviews）。`
@@ -607,7 +602,7 @@ async function finishMerge(issueNum, prNum) {
   }
   if (!approvalNote) {
     try {
-      gh(['pr', 'review', String(prNum), '--approve', '--body', approveBody]);
+      gh(['pr', 'review', String(prNum), '--approve', '--body', assertNoSecrets(approveBody, `PR #${prNum} review 正文`)]);
       approvalNote = '批准由当前 gh 账号提交。';
     } catch (e) {
       commentOnPr(prNum, '🤖 Agent B 已批准（当前账号无法提交正式 approve review —— 通常因为它是该 PR 的作者；以本评论作为批准记录）+ Agent C 测试通过。');
@@ -885,6 +880,8 @@ async function main() {
   }
 }
 
+// 兼容既有引用：`scripts/validate.mjs` 从 pipeline 取 assertNoSecrets / SECRET_PATTERNS。
+// 真正的实现只有一份（lib.mjs），这里只是转出。
 export { assertNoSecrets, SECRET_PATTERNS };
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);

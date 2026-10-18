@@ -669,3 +669,79 @@ SyntaxError: The requested module './lib.mjs' does not provide an export named '
   列出名字；拼错即报错。**静默跳过 = 假绿**。
 - 环境和代码要分层：`doctor` 面向"装/跑"（全绿口径），`validate` 面向"仓库是否健康"
   （只看仓库类）。同一个脚本同时服务两者时，**必须提供按类裁剪的入口**。
+
+---
+
+## 28. 凭据防线只覆盖了它被写在的地方（→ 改成结构性保证 + 日志脱敏）
+
+**现象**（2026-10-16 事故，提交 `c36aca5`，issue #21 复盘）：一条 PR 评论的正文里
+写着 `$(gh auth token --user <owner>)`，被 shell 展开成**真 OAuth 令牌**并贴进 PR 评论；
+GitHub secret scanning **自动吊销**该令牌 → 之后每个 `gh` 调用 401，整条流水线卡死。
+代价不是"改一下"而是**凭据作废**：已推送的令牌无法收回，只能吊销。
+
+事后加了硬拦截 `assertNoSecrets()`，但只挂在 **3 个调用点**（`commentOnIssue`、
+`commentOnPr`、`pr create --body`）。同一份代码里还有 **7 类出站/落盘路径裸奔**（grep 实测）：
+
+| 位置 | 风险 |
+|---|---|
+| `reportGap()`（上游 feedback，2 处 `issue create`） | **跨仓库公开泄漏**：`err.stack` / 错误原文经 opt-in 发到第三方仓库 `cfg.upstream`；远端 URL 内嵌凭据的 push 报错就会整条发出去 |
+| `gh pr review --approve --body`（2 处） | 同类出站点，正文当时是静态串，但新增字段即失守 |
+| `pm/screen.mjs` 筛选判定评论 | 正文含**模型生成**的 WHY / SCOPE / TESTABILITY / REFINED_TASK |
+| `pm/screen.mjs` `issue edit --body` | 把原正文 + 模型生成内容拼回去**整体覆盖**已发布 issue |
+| `pm/screen.mjs` REJECT/SPLIT 评论 | 同上，含模型生成内容 |
+| `log()` → `.agent/logs/issue-N.md` | 日志**原样落盘** pi/模型输出与异常栈；人类排障时会把日志贴进 issue（lessons #25 的评论损坏事故正是"内容贴来贴去"） |
+| PM 的 `screen-*.md` | 同日志路径 |
+
+**为什么"只加在 3 个地方"必然漏**：防线写在调用点，就要求每个新增出站点的人都
+"记得加"。这类保证会随代码增长而衰减，且衰减是静默的（没有测试会变红）。
+
+**修复（结构性 + 可测 + fail-closed）**：
+
+1. **实现只留一份**：`SECRET_PATTERNS` / `assertNoSecrets` / 新增 `redactSecrets` /
+   `countSecretMatches` 全部移入 `templates/lib.mjs`（无副作用；`pipeline.mjs` 与
+   `pm/screen.mjs` 都已 import lib）。`pipeline.mjs` 保留 `export { assertNoSecrets,
+   SECRET_PATTERNS }` 兼容既有引用。
+2. **规则二分**（两个 helper，不是一个）：
+   - **硬拦截**（`assertNoSecrets` throw）= agent **自己撰写**的正文：pipeline 评论、
+     PR 正文、`pr review` 正文。宁可不发一条评论，也不泄漏。
+   - **脱敏后发送**（`redactSecrets`）= **必须留下审计记录**的通道：上游 feedback、
+     筛选判定评论、`issue edit --body`、本地日志。凭据必须去掉，但判定本身
+     **绝不能因检测到凭据而丢失**，否则审计断链。脱敏命中时留痕
+     （"已自动脱敏 N 处疑似凭据" / `[_已脱敏 N 处_]`），人类能看出这里被处理过。
+3. **`log()` 单点收口**：一个函数覆盖 pi 输出、review 输出、retry 日志、循环异常栈 →
+   一次改动覆盖所有日志路径，不需要在每个 `log()` 调用点重复。
+4. **lint 变成断言**：`scripts/validate.mjs` 7e 要求 `templates/pipeline.mjs` 与
+   `templates/pm/screen.mjs` 里**每个** `'--body'` 所在行同时出现 `assertNoSecrets(` 或
+   `redactSecrets(`；`templates/prompts/*.md`、`templates/pm/*.md` 中不得出现 `--body "`。
+   新增出站点不包裹 → `npm test` 红（已实测：去掉一处包裹即 2 FAILURE）。
+5. **修掉自相矛盾的提示词**：`templates/prompts/reviewer.md` 一边禁止双引号正文，
+   一边示范 `gh pr comment <PR#> --body "…"`；`pm/prompt.md` 同样用
+   `--body "$(cat <<'EOF' …)"`。全部改成 `--body-file`（正文先写文件），并补一句
+   "正文需引用命令输出时先写文件；出现 `$(`/反引号/令牌形状一律不直接发送"。
+   旧的 7b 检查只 grep "文件里存在 `--body-file` 字样"，所以矛盾示范能长期存活 ——
+   断言必须**同时禁止坏写法**，否则它只证明"好写法出现过"。
+
+**外部共识（同类实践）**：
+
+- GitHub push protection / secret scanning 会在**已推送**后吊销凭据 → 必须**发送前**拦截。
+  https://docs.github.com/en/code-security/secret-scanning/introduction/about-push-protection
+- gitleaks 的定位即 "detect secrets **before** they get committed/pushed" —— 前置扫描是成熟模式。
+  https://github.com/gitleaks/gitleaks
+- 脱敏必须**覆盖日志**并且**可测 / fail-closed**（IRLight #468 脱敏日志检查 false-negative、
+  #481 secret diagnostics 必须 fail-closed）。
+  https://github.com/azumag/IRLight/issues/468 · https://github.com/azumag/IRLight/issues/481
+- https://owasp.org/www-project-top-10-for-large-language-model-applications/（敏感信息泄漏，输出侧同样要治理）
+
+**教训**：
+
+- **安全防线要写成"结构性保证"，不是"记得加"**：共享 helper + 静态 lint 断言，
+  让遗漏变成红测试，而不是变成事故。
+- **拦截与脱敏是两个不同承诺**，混用会两头坏：全拦 → 审计记录丢失；
+  全脱敏 → agent 自己写的正文里带着凭据继续流动。按"这条通道能不能丢"二分。
+- **日志是出站点**。最容易被人类触碰的路径（把日志贴进 issue）必须默认脱敏。
+- **示例即文档**：提示词里的示范会被模型照抄。禁令与示范矛盾时，模型学的是示范。
+- **可测性就是可信度**：`redactSecrets` 做纯函数（幂等、只留 4 位前缀、正常文本零误报），
+  `reportGap` / `log()` 用假 `gh` + 临时仓库跑真实 pipeline 断言 —— 不靠"看起来对了"。
+
+**已知边界（本 PR 不做）**：不拦截模型自己在 bash 里跑出的 `gh` 调用（代码不可控，
+只能靠提示词）；不引入第三方扫描器。

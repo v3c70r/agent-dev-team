@@ -68,9 +68,10 @@ Every proposal MUST satisfy:
 For each proposal you keep (normally exactly one):
 
 ```bash
-gh issue create --label pm-proposal \
-  --title "<concise, imperative, user-facing>" \
-  --body "$(cat <<'EOF'
+# 先把正文写进文件（heredoc 只写文件，不参与命令行参数展开），再 --body-file。
+# 绝不要把正文塞进 --body 后面的双引号里：shell 会展开其中的命令替换/反引号，
+# 正文被损坏，甚至把真令牌发出去（docs/lessons.md #6 / #28，2026-10-16 真实事故）。
+cat > /tmp/proposal-body.md <<'EOF'
 ## 背景 / 证据
 <problem + evidence, with URLs or file references>
 
@@ -86,7 +87,10 @@ gh issue create --label pm-proposal \
 ## 参考
 - <links>
 EOF
-)"
+
+gh issue create --label pm-proposal \
+  --title "<concise, imperative, user-facing>" \
+  --body-file /tmp/proposal-body.md
 ```
 
 Write the issue body in the language the repo owner uses (check recent issues

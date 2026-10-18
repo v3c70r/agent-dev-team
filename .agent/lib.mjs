@@ -224,3 +224,71 @@ export function resolvePi() {
   PI_BIN = 'pi';
   return PI_BIN;
 }
+
+// ── 出站凭据防线（issue #21）─────────────────────────────────────────
+// 2026-10-16 真实事故（提交 c36aca5）：评论正文里的 `$(gh auth token …)` 被 shell
+// 展开成**真令牌**并贴进 PR 评论 → GitHub secret scanning 自动吊销 → 全链路 401，
+// 流水线卡死。事后加了 `assertNoSecrets()`，但只挂在 3 个调用点，其余出站/落盘路径
+// （上游 feedback、`gh pr review --body`、筛选器评论、`issue edit --body`、日志）全部
+// 裸奔。把模式与两个 helper 放进 lib 是**结构性**修复：两个入口（pipeline、pm/screen）
+// 都从同一份实现取值，`scripts/validate.mjs` 的 lint（7e）再保证每个 `'--body'`
+// 调用点都被包裹（漏一处 → `npm test` 红）。docs/lessons.md #28。
+//
+// 规则二分（为什么不是一个函数解决）：
+//   * agent **自己撰写**的正文（pipeline 评论 / PR 正文 / review 正文）→ 硬拦截
+//     （`assertNoSecrets` throw）：宁可少发一条评论，也不泄漏凭据。
+//   * **必须留下审计记录**的通道（上游 feedback、筛选判定评论、`issue edit --body`、
+//     本地日志）→ 脱敏后发送（`redactSecrets`）：凭据绝不能发出去，但判定本身
+//     绝不能因检测到凭据而丢失，否则审计断链。
+export const SECRET_PATTERNS = [
+  /\bgh[pousr]_[A-Za-z0-9]{16,}\b/,        // GitHub OAuth / PAT / user / server token
+  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/,      // fine-grained PAT
+  /\bglpat-[A-Za-z0-9_-]{16,}\b/,          // GitLab
+  /\bsk-[A-Za-z0-9_-]{16,}\b/,             // OpenAI-style secret key
+  /\bAKIA[0-9A-Z]{16}\b/,                  // AWS access key id
+  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/,      // Slack
+];
+
+/** How many token-shaped substrings does `text` contain? (pure; for audit counts) */
+export function countSecretMatches(text) {
+  const str = String(text ?? '');
+  let n = 0;
+  for (const re of SECRET_PATTERNS) {
+    const g = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
+    n += (str.match(g) || []).length;
+  }
+  return n;
+}
+
+/**
+ * Replace every token-shaped substring with `<redacted:gho_>` (first 4 chars only —
+ * enough to tell *which kind* of credential leaked while never revealing it).
+ * Pure + **idempotent** (`redactSecrets(redactSecrets(x)) === redactSecrets(x)`),
+ * zero false positives on normal prose / URLs / ordinary words.
+ */
+export function redactSecrets(text) {
+  let out = String(text ?? '');
+  for (const re of SECRET_PATTERNS) {
+    const g = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
+    out = out.replace(g, (m) => `<redacted:${m.slice(0, 4)}>`);
+  }
+  return out;
+}
+
+/**
+ * Hard block (fail-closed): refuse to send text containing a token shape.
+ * Used for bodies the pipeline itself writes — never "sanitize then send".
+ */
+export function assertNoSecrets(text, where = 'GitHub 正文') {
+  const str = String(text ?? '');
+  for (const re of SECRET_PATTERNS) {
+    const m = str.match(re);
+    if (m) {
+      // 报错里只暴露前 6 位，避免把泄漏内容再写进日志/工单
+      throw new Error(
+        `拒绝发送 ${where}：正文中含疑似凭据（${m[0].slice(0, 6)}…，len=${m[0].length}）。` +
+        '这是硬拦截，请移除凭据后重试（docs/lessons.md #28）');
+    }
+  }
+  return str;
+}

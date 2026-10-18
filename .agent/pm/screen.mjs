@@ -21,7 +21,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { sh, detectBase, resolvePi } from '../lib.mjs';
+import { sh, detectBase, resolvePi, redactSecrets, countSecretMatches } from '../lib.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const AGENT = path.join(ROOT, '.agent');
@@ -59,7 +59,9 @@ function loadEnv() {
 function loadConfig() { try { return JSON.parse(readFileSync(path.join(AGENT, 'config.json'), 'utf8')); } catch { return {}; } }
 function gh(a) { return sh(['gh', ...a]); }
 function ghJson(a) { return JSON.parse(gh(a)); }
-function log(msg) { console.log(`[screen ${new Date().toISOString().replace('T', ' ').slice(0, 19)}] ${msg}`); }
+// 日志同样是出站点（issue #21）：模型输出 / WHY / SCOPE 会原样落盘，排障时人类会把
+// `screen-*.md` 贴进 issue。这里控制台与文件日志都先过 redactSecrets（脱敏，不拦截）。
+function log(msg) { console.log(`[screen ${new Date().toISOString().replace('T', ' ').slice(0, 19)}] ${redactSecrets(msg)}`); }
 
 const CFG = { ...loadConfig() };
 loadEnv();
@@ -182,7 +184,7 @@ function screenOne(issue, budgetLeft) {
   mkdirSync(LOG_DIR, { recursive: true });
   const stamp = new Date().toISOString().slice(0, 10);
   writeFileSync(path.join(LOG_DIR, `screen-${stamp}.md`),
-    `# Screener run ${new Date().toISOString()} — issue #${issue.number}\nmodel: ${SCREEN.provider}/${SCREEN.model}\nverdict: ${verdict}\n\n${out}\n`,
+    `# Screener run ${new Date().toISOString()} — issue #${issue.number}\nmodel: ${SCREEN.provider}/${SCREEN.model}\nverdict: ${verdict}\n\n${redactSecrets(out)}\n`,
     { flag: 'a' });
 
   const head = `🤖 **提案筛选（独立 agent，${SCREEN.provider}/${SCREEN.model}）**\n\n` +
@@ -195,12 +197,19 @@ function screenOne(issue, budgetLeft) {
     const body = head + (refined ? `\n### 给 Agent A 的收紧任务\n${refined}\n` : '') +
       `\n${auto ? '✅ 已自动批准（本周自动实现余额 ' + (budgetLeft - 1) + '）→ 流水线将开始实现。'
                : '⏸ 未自动批准（自动实现已关闭或本周余额用尽）→ 等你 `/approve`。'}`;
-    gh(['issue', 'comment', String(issue.number), '--body', body]);
+    // 筛选判定是**审计记录**：凭据必须去掉，但判定本身绝不能因检测到凭据而丢失
+    // （否则审计断链）→ 脱敏后发送，并在日志里留下“已脱敏 N 处”的痕迹（lessons #28）。
+    const hidden = countSecretMatches(body);
+    const safeBody = redactSecrets(body);
+    if (hidden) log(`⚠️ #${issue.number} 判定正文命中 ${hidden} 处疑似凭据 → 已脱敏后发送`);
+    gh(['issue', 'comment', String(issue.number), '--body', redactSecrets(safeBody)]);
     // 把收紧后的任务追加到正文，确保 Agent A 读到
     if (refined) {
       const marker = '<!-- agent-screener -->';
-      const newBody = `${issue.body || ''}\n\n---\n\n${marker}\n## Agent 筛选结论与实现范围（自动追加）\n\n${head}${refined ? `\n### 给 Agent A 的收紧任务\n${refined}` : ''}\n`;
-      try { gh(['issue', 'edit', String(issue.number), '--body', newBody]); } catch (e) { log('body update failed: ' + e.message); }
+      const newBody = `${issue.body || ''}\n\n---\n\n${marker}\n## Agent 筛选结论与实现范围（自动追加）\n\n${safeBody}${refined ? `\n### 给 Agent A 的收紧任务\n${refined}` : ''}\n`;
+      const hiddenBody = countSecretMatches(newBody);
+      if (hiddenBody) log(`⚠️ #${issue.number} issue 正文命中 ${hiddenBody} 处疑似凭据 → 已脱敏后写入`);
+      try { gh(['issue', 'edit', String(issue.number), '--body', redactSecrets(newBody)]); } catch (e) { log('body update failed: ' + e.message); }
     }
     const labels = [LABEL_SCREENED];
     if (auto) labels.push(LABEL_APPROVED, LABEL_AUTO);
@@ -211,7 +220,9 @@ function screenOne(issue, budgetLeft) {
   // REJECT / SPLIT → 关闭 + 记入产品记忆
   const body = head + (splitPlan ? `\n### 拆分建议\n${splitPlan}\n` : '') +
     `\n❌ ${verdict === 'SPLIT' ? '方向有价值但 scope 过大/缺前置条件 —— 已按策略关闭，拆分建议见上；如认可可重开更小的 issue。' : '判定不值得实现 —— 已关闭并记入 PM 记忆，避免重复提案。'}`;
-  gh(['issue', 'comment', String(issue.number), '--body', body]);
+  const hidden = countSecretMatches(body);
+  if (hidden) log(`⚠️ #${issue.number} 判定正文命中 ${hidden} 处疑似凭据 → 已脱敏后发送`);
+  gh(['issue', 'comment', String(issue.number), '--body', redactSecrets(body)]);
   try { gh(['issue', 'edit', String(issue.number), '--add-label', LABEL_SCREENED, '--add-label', LABEL_REJECTED]); }
   catch (e) { log(`⚠️ 标签写入失败（会丢失 pm-screened/agent-rejected 标记）: ${String(e.message).slice(0, 160)}`); }
   try { gh(['issue', 'close', String(issue.number), '--reason', 'not planned']); } catch {}
