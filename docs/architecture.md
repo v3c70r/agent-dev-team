@@ -98,7 +98,8 @@ pr_open  ─ retry → 拒绝（无需重试）
 | 筛选判定评论 / `issue edit --body`（审计通道） | 脱敏后发送（判定不能丢） | `redactSecrets()` |
 | `docs/proposal-audit.md`（`git commit` + `push` 到 BASE，**进提交历史**） | 脱敏后写入（最硬的出口） | `redactSecrets()` 在 `one()` |
 | 本地日志 `.agent/logs/issue-<N>.md`、`pm/logs/screen-*.md` | 落盘前脱敏（`log()` 单点收口） | `redactSecrets()` |
-| `retry --list` / `review --pr` 尾输出 / `--check` JSON（终端） | 终端也是出口（tmux / CI 日志 / 截图） | `formatRetryList()` 内部 + `console.log(redactSecrets(...))` |
+| `retry --list` / `review --pr` 尾输出 / `--check` / `status` JSON（终端） | 终端也是出口（tmux / CI 日志 / 截图） | `formatRetryList()` 内部 + `console.log(redactSecrets(...))` |
+| 所有诊断输出（`console.warn/error` 的 `e.message` / stack） | **模块级单一收口**：`sh()` 把 stderr 原文拼进 `e.message`，不得裸打终端 | pipeline 的 `cwarn()` / `cerr()`（validate 7e-2 禁裸 `console.warn/error`） |
 
 为什么不是一个函数：全拦会把审计记录（筛选判定、上游反馈）一并丢掉 → 审计断链；
 全脱敏又会让 agent 自己写的正文带着凭据继续流动。按“这条通道能不能丢”二分。

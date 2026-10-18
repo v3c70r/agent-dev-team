@@ -2,7 +2,7 @@
 // validate.mjs — the maintenance repo's own "build + test" (dogfooded by Agent C).
 // Checks: syntax of all mjs/sh, SKILL.md frontmatter, template completeness,
 // doctor self-check, and that the live .agent/ copies match templates/ (no drift).
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, mkdtempSync, rmSync, copyFileSync, chmodSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -207,6 +207,36 @@ const lintBodyCallSites = (src) => {
   problems.length ? fail(`出站正文 lint (7e): ${problems.join('; ')}`) : ok("出站正文 lint (7e): 每个 '--body' 调用点都被 assertNoSecrets/redactSecrets 包裹；提示词无 `--body \"` 示范");
 }
 
+// 7e-2) **终端收口 lint**（Agent B review 第 2 轮）：`sh()` 抛出的 `e.message` 里带
+//       `execFileSync` 拼进来的 stderr 原文（远端 URL 内嵌凭据的报错），原样 console.warn/error
+//       就进了 tmux 窗格 / CI 日志 / 截图。pipeline 必须在**模块级单一收口点**（cwarn/cerr）
+//       过 redactSecrets，禁止直接调 console.warn/console.error。
+const lintTerminalExit = (src) => {
+  const bad = [];
+  String(src).split('\n').forEach((line, i) => {
+    if (!/console\.(warn|error)\(/.test(line)) return;
+    bad.push(i + 1);
+  });
+  return bad;
+};
+{
+  const problems = [];
+  // 破坏性自检：lint 必须能抓到“把 e.message 直接打终端”
+  if (lintTerminalExit("console.error(e.message);\n").length !== 1) problems.push('lint 自检失败：裸 console.error(e.message) 未被判定为违规');
+  if (lintTerminalExit("cerr(e.message);\ncwarn('x', err);\n").length !== 0) problems.push('lint 自检失败：收口点调用被误报');
+  const pipeSrc = readFileSync(path.join(ROOT, 'templates/pipeline.mjs'), 'utf8');
+  const bad = lintTerminalExit(pipeSrc);
+  if (bad.length) problems.push(`templates/pipeline.mjs 仍有裸 console.warn/error（行 ${bad.join(',')}）—— 请改用 cwarn/cerr`);
+  if (!/function cwarn\(/.test(pipeSrc) || !/function cerr\(/.test(pipeSrc)) problems.push('templates/pipeline.mjs 缺少 cwarn/cerr 收口点');
+  const wrapped = (pipeSrc.match(/\b(?:cwarn|cerr)\(/g) || []).length;
+  if (wrapped < 10) problems.push(`cwarn/cerr 使用点过少（${wrapped}）——收口可能没接上`);
+  // `description`：错误栈也必须过收口（main().catch 打完整 stack）
+  if (!/main\(\)\.catch\(e => \{\s*cerr\(e\)/.test(pipeSrc.replace(/\n\s*/g, ' '))) problems.push('main().catch 未走 cerr（未捕获异常的完整 stack 会裸打终端）');
+  problems.length
+    ? fail(`终端出站 lint (7e-2): ${problems.join('; ')}`)
+    : ok(`终端出站 lint (7e-2): pipeline 无裸 console.warn/error，全部走 cwarn/cerr（${wrapped} 处），main().catch 也过收口`);
+}
+
 // 7f) **离线端到端**：脱敏不只是纯函数。用假 `gh` 跑真实 pipeline（mkdir 临时仓）。
 //     (1) `feedback` 子命令 → 上游 issue 的 title/body 均无完整令牌，且带上「已脱敏 N 处」
 //     (2) `retry --issue N` → 落盘日志 .agent/logs/issue-N.md 无完整令牌
@@ -395,6 +425,77 @@ const lintBodyCallSites = (src) => {
       : ok('审计出站脱敏 (7g): recordRejection 推送到 BASE 的 docs/proposal-audit.md（及判定评论/终端）无完整令牌');
   } catch (e) {
     fail(`审计出站脱敏 (7g): ${e.message}`);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// 7h) **终端出站端到端**（Agent B review 第 2 轮）：`sh()` 把 stderr 原文拼进 `e.message`，
+//     所以「gh 远端 URL 内嵌凭据」的报错会原样跑到 `console.warn/error`（tmux 窗格 /
+//     CI 日志 / 截图）。这里用假 `gh` 往 stderr 写带令牌的错误，断言进程输出里没有完整令牌。
+{
+  const TOKT = 'gho_' + 'Stderr'.repeat(6);   // 36 位，命中 GitHub token 形态
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'agent-term-'));
+  try {
+    mkdirSync(path.join(tmp, '.agent'), { recursive: true });
+    copyFileSync(path.join(ROOT, 'templates/pipeline.mjs'), path.join(tmp, '.agent/pipeline.mjs'));
+    copyFileSync(path.join(ROOT, 'templates/lib.mjs'), path.join(tmp, '.agent/lib.mjs'));
+    // feedback 通道（opt-in + upstream）同时开启，用于覆盖 cwarn 路径（reportGap 的 catch）
+    writeFileSync(path.join(tmp, '.agent/config.json'), JSON.stringify({ upstream: 'acme/agent-dev-team', feedbackOptIn: true }));
+    writeFileSync(path.join(tmp, '.agent/state.json'), JSON.stringify({
+      7: { status: 'needs_human', pr: 5, error: `merge failed: https://x-access-token:${TOKT}@github.com/acme/x` },
+    }, null, 2));
+    const bin = path.join(tmp, 'bin');
+    mkdirSync(bin, { recursive: true });
+    // 假 gh：每个调用都失败，并把“远端 URL 内嵌凭据”写到 stderr（node 会拼进 e.message）
+    writeFileSync(path.join(bin, 'gh'), [
+      '#!/usr/bin/env node',
+      "process.stderr.write('remote: refusing: https://x-access-token:' + process.env.FAKE_TOK + '@github.com/acme/x\\n');",
+      'process.exit(1);',
+      '',
+    ].join('\n'));
+    chmodSync(path.join(bin, 'gh'), 0o755);
+    // 假 git：同样吐带令牌的 stderr（覆盖 run/实现分支里的 git 报错路径）
+    writeFileSync(path.join(bin, 'git'), [
+      '#!/usr/bin/env node',
+      "process.stderr.write('fatal: unable to access https://x-access-token:' + process.env.FAKE_TOK + '@github.com/acme/x\\n');",
+      'process.exit(1);',
+      '',
+    ].join('\n'));
+    chmodSync(path.join(bin, 'git'), 0o755);
+    // spawnSync（不是 execFileSync）：成功退出时也要拿到 stderr —— cwarn 走 stderr，
+    // 而 console.error/execFileSync 的成功路径不返回 stderr，会让断言变成假绿。
+    const run = (args) => {
+      const r = spawnSync('node', [path.join(tmp, '.agent/pipeline.mjs'), ...args], {
+        cwd: tmp, encoding: 'utf8', stdio: 'pipe',
+        env: { ...process.env, PATH: bin + path.delimiter + (process.env.PATH || ''), FAKE_TOK: TOKT },
+      });
+      return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
+    };
+    const problems = [];
+    const cases = [
+      // (1) `retry` 查标签失败 → cerr(e.message)（:769）
+      ['retry', ['retry', '--issue', '7'], 2],
+      // (2) `run` 失败 → main().catch(e => cerr(e))（完整 stack）
+      ['run', ['run', '--issue', '7'], null],
+      // (3) `status` 打印 state.json（error/lastError 是原始报错）
+      ['status', ['status'], 0],
+      // (4) `feedback` → reportGap 的 catch 走 cwarn(e.message)（gh 失败带令牌 stderr）
+      ['feedback', ['feedback', 't', 'b'], 0],
+    ];
+    for (const [label, args, expectCode] of cases) {
+      const r = run(args);
+      const all = `${r.out || ''}\n${r.err || ''}`;
+      if (expectCode !== null && r.code !== expectCode) problems.push(`${label}: exit ${r.code}（期望 ${expectCode}）`);
+      if (expectCode === null && r.code === 0) problems.push(`${label}: 应该失败但 exit 0`);
+      if (all.includes(TOKT)) problems.push(`${label}: 终端输出（stdout/stderr）含完整令牌`);
+      if (!all.includes('<redacted:')) problems.push(`${label}: 终端输出未见脱敏标记（脱敏可能未生效）`);
+    }
+    problems.length
+      ? fail(`终端出站脱敏 (7h): ${problems.join('; ')}`)
+      : ok('终端出站脱敏 (7h): retry / run（完整 stack）/ status 的终端输出均无完整令牌（cwarn/cerr 收口）');
+  } catch (e) {
+    fail(`终端出站脱敏 (7h): ${e.message}`);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }

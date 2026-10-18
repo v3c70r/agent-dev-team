@@ -767,3 +767,42 @@ GitHub secret scanning **自动吊销**该令牌 → 之后每个 `gh` 调用 40
 枚举的，而风险是**按"数据最终到哪里"**定义的。可复用的判定方法：对每条出站路径问三句——
 ① 内容里有没有模型生成/外部输入？② 它最终落到哪（评论 / issue 正文 / **提交历史** /
 终端 / 日志文件）？③ 落错之后能不能撤销？**"不能撤销"的那类（提交历史）优先级最高。**
+
+**补漏 2（Agent B review 第 2 轮）：终端诊断输出没脱敏**
+
+`sh()` 用 `execFileSync`，它把**子进程 stderr 原文拼进 `e.message`** —— 也就是说
+"远端 URL 内嵌凭据的 push/merge/api 报错"会随着 `e.message` 一起流动。上一轮已经把
+`log()`（文件）脱敏了，但 `console.warn/console.error`（终端，13 处 + `main().catch` 打完整
+stack）还是裸的 —— 而终端恰是 **tmux 窗格 / CI 日志 / 截图** 的入口，也是 lessons #25
+「内容贴来贴去」的起点。`reportGap()` 早就在用"错误原文可能带凭据"这条论证给自己脱敏，
+同一份文件里却没把这条论证应用到终端，这就是**同一主题上的不一致**。
+
+修法（模块级单一收口，成本最小、覆盖面最大）：
+
+```js
+function scrub(v) { return v instanceof Error ? redactSecrets(v.stack || v.message) : redactSecrets(String(v)); }
+function cwarn(...args) { process.stderr.write(args.map(scrub).join(' ') + '\n'); }
+function cerr(...args) { process.stderr.write(args.map(scrub).join(' ') + '\n'); }
+```
+
+`pipeline.mjs` 里所有 `console.warn/error`（含 `main().catch`）改用 `cwarn/cerr`；
+`status` 打印的 `state.json`、watch 循环打印的 issue 标题也过 `redactSecrets`。
+
+断言（都会变红）：
+
+- validate **7e-2** 静态 lint：`templates/pipeline.mjs` 不得出现**裸 `console.warn/error(`**
+  （handler 自身除外，所以收口点用 `process.stderr.write` 实现），且必须存在
+  `function cwarn(` / `function cerr(`、使用点 ≥10、`main().catch` 必须走 `cerr`。
+- validate **7h** 端到端：假 `gh`/`git` 往 stderr 写带令牌的"远端 URL 内嵌凭据"报错，
+  分别跑 `retry`（`cerr(e.message)`）、`run`（`main().catch` 打完整 stack）、`status`
+  （state.json 里的原始 error）、`feedback`（`cwarn` 路径），断言 stdout+stderr 均无完整令牌。
+  这里必须用 `spawnSync` 而不是 `execFileSync`：**后者在成功退出时不返回 stderr**，
+  会让断言变成假绿（本轮实测踩到：`cwarn` 那条一直是"通过"的）。
+
+**教训**：
+
+- **"脱敏了文件日志"不等于"脱敏了错误"**：同一条字符串有多个出口（文件 / 终端 / 评论 /
+  提交历史），每个出口都要单独收口；收口方式优先选**模块级 wrapper**，而不是逐点改。
+- **断言要拿到真正的那条流**：`execFileSync` 成功路径看不到 stderr、`console.warn` 走的是
+  stderr —— 测试工具选错会让"我加了断言"变成"我加了永不失败的断言"。写完断言**必须做
+  一次负向验证**（去掉修复 → 断言变红），否则不知道它到底在测什么。

@@ -45,6 +45,23 @@ const TMP = path.join(AGENT, 'tmp');
 const LABEL_APPROVED = 'agent-approved';
 const BASE = detectBase();
 
+// ── 终端也是出站点（lessons #28 / Agent B review 第 2 轮）──────────────
+// `sh()` 抛出的 `e.message` 里带着 `execFileSync` 拼进来的 **stderr 原文**（远端 URL
+// 内嵌凭据的 push / merge / api 报错就是典型）；直接 `console.warn/error` 就进了
+// tmux 窗格 / CI 日志 / 截图 —— 人类最容易把这类内容贴进 issue 的路径（lessons #25）。
+// 与 `log()` 落盘脱敏是同一条论证，只是出口从文件变成终端。
+// 结构保证：`scripts/validate.mjs` 的 7e 要求本文件**不再出现裸 `console.warn/error`**，
+// 7h 用假 `gh` 制造带令牌的 stderr，断言进程输出里没有完整令牌。
+// （用 process.stderr.write 而不是 console.*：一是避免 lint 把收口点自己当违规，
+//   二是保持与 console 一致的“一行一条”语义。）
+function scrub(v) {
+  return v instanceof Error
+    ? redactSecrets(v.stack || v.message)
+    : redactSecrets(String(v));
+}
+function cwarn(...args) { process.stderr.write(args.map(scrub).join(' ') + '\n'); }
+function cerr(...args) { process.stderr.write(args.map(scrub).join(' ') + '\n'); }
+
 // ── upstream feedback (self-improvement of the agent-dev-team skill) ──
 // .agent/config.json: { "upstream": "<owner>/<repo>", "feedbackOptIn": true }
 
@@ -87,7 +104,7 @@ function reportGap(title, body) {
     const since = new Date(Date.now() - 864e5).toISOString().slice(0, 10);
     const recent = ghJson(['issue', 'list', '-R', cfg.upstream, '--state', 'all',
       '--search', `[skill-feedback] created:>=${since}`, '--limit', '10', '--json', 'number']);
-    if (recent.length >= 3) { console.warn('[feedback] daily cap reached, skip'); return; }
+    if (recent.length >= 3) { cwarn('[feedback] daily cap reached, skip'); return; }
     const hidden = countSecretMatches(title) + countSecretMatches(body);
     const redactNote = hidden ? `\n\n> 🔒 已自动脱敏 ${hidden} 处疑似凭据（不含完整令牌）。` : '';
     const full = `${redactSecrets(body)}${redactNote}\n\n---\n_自动反馈来自 agent-dev-team 流水线（opt-in）。不应包含用户代码；如包含请维护者删除。 ${new Date().toISOString()}_`;
@@ -98,8 +115,8 @@ function reportGap(title, body) {
       // most users lack label rights upstream — retry without label
       gh(['issue', 'create', '-R', cfg.upstream, '--title', `[skill-feedback] ${safeTitle}`, '--body', redactSecrets(full)]);
     }
-    console.warn(`[feedback] filed upstream: [skill-feedback] ${safeTitle}`);
-  } catch (e) { console.warn('[feedback] failed:', redactSecrets(e.message)); }
+    cwarn(`[feedback] filed upstream: [skill-feedback] ${safeTitle}`);
+  } catch (e) { cwarn('[feedback] failed:', e.message); }
 }
 
 // ── tiny helpers ──
@@ -129,9 +146,9 @@ function reviewerEnv() {
   try {
     const tok = sh(['gh', 'auth', 'token', '--user', reviewerGhUser()]).trim();
     _reviewerEnvCache = tok ? { ...process.env, GH_TOKEN: tok } : {};
-    if (!tok) console.warn(`[reviewer] ${reviewerGhUser()} 无可用 token，回退到当前 gh 账号`);
+    if (!tok) cwarn(`[reviewer] ${reviewerGhUser()} 无可用 token，回退到当前 gh 账号`);
   } catch (e) {
-    console.warn(`[reviewer] 无法获取 ${reviewerGhUser()} 的 token（${e.message}），回退到当前 gh 账号`);
+    cwarn(`[reviewer] 无法获取 ${reviewerGhUser()} 的 token（${e.message}），回退到当前 gh 账号`);
     _reviewerEnvCache = {};
   }
   return _reviewerEnvCache;
@@ -281,7 +298,7 @@ async function runReviewRound(issueNum, prNum) {
     if (!isModelUnavailable(err)) throw err;
     const fallback = REVIEW_FALLBACK;
     const detail = String((err.stderr || err.message || '')).slice(0, 300);
-    console.warn(`[review] ${describeModel(REVIEW)} unavailable → fallback ${describeModel(fallback)}: ${detail}`);
+    cwarn(`[review] ${describeModel(REVIEW)} unavailable → fallback ${describeModel(fallback)}: ${detail}`);
     log(issueNum, `B: 模型不可用（${describeModel(REVIEW)}）→ 回退到 ${describeModel(fallback)}`);
     try { commentOnPr(prNum, `⚠️ **审查模型不可用**（\`${describeModel(REVIEW)}\`）：\`${detail.replace(/\n/g, ' ')}\`\n\n已自动回退到 \`${describeModel(fallback)}\` 完成本轮审查（不影响合并）。\n长期方案：为账户充值，或设置 \`REVIEW_PROVIDER\`/\`REVIEW_MODEL\` 指向可用模型。`); } catch {}
     reportGap(`审查模型不可用（${describeModel(REVIEW)}）`, `## 现象\n审查轮次调用模型失败，错误被判定为额度/限流类。\n\n## 模型\n- 主: ${describeModel(REVIEW)}\n- 回退: ${describeModel(fallback)}\n\n## 错误\n\`\`\`\n${detail}\n\`\`\`\n\n## 建议\n模板已自动回退；可考虑在 doctor 中预检模型额度（\`pi auth check\` 不检测余额），或支持多模型候选列表。`);
@@ -596,7 +613,7 @@ async function finishMerge(issueNum, prNum) {
           ? `批准由独立账号 **${reviewerGhUser()}** 提交 —— 但该账号只有只读权限，**此批准不会计入分支保护的 required reviews**（需要硬门禁请给它 write 权限）。`
           : `批准由独立账号 **${reviewerGhUser()}** 提交。`;
     } catch (e) {
-      console.warn('[reviewer] 独立账号批准失败，回退到当前账号：' + e.message);
+      cwarn('[reviewer] 独立账号批准失败，回退到当前账号：' + e.message);
       log(issueNum, `B: 独立账号 ${reviewerGhUser()} 批准失败（${e.message}），回退`);
     }
   }
@@ -618,11 +635,11 @@ async function finishMerge(issueNum, prNum) {
     if (cur === 'HEAD') {
       try { sh(['git', 'checkout', BASE]); }
       catch (e) {
-        console.warn('checkout BASE before merge failed (continuing):', e.message);
+        cwarn('checkout BASE before merge failed (continuing):', e.message);
         log(issueNum, `合并前切回 ${BASE} 失败（${e.message}），继续尝试合并`);
       }
     }
-  } catch (e) { console.warn('detached-HEAD probe failed (continuing):', e.message); }
+  } catch (e) { cwarn('detached-HEAD probe failed (continuing):', e.message); }
 
   // ── 合并：无论退出码如何，都不把它当作结果 ──
   let mergeErr = null;
@@ -630,7 +647,7 @@ async function finishMerge(issueNum, prNum) {
     gh(['pr', 'merge', String(prNum), '--squash', '--delete-branch']);
   } catch (e) {
     mergeErr = e;
-    console.warn('merge command failed (will verify real state):', e.message);
+    cwarn('merge command failed (will verify real state):', e.message);
   }
 
   // ── 读回 PR 的真实状态（不可逆动作只认读回状态，issue #16）──
@@ -639,7 +656,7 @@ async function finishMerge(issueNum, prNum) {
   try {
     prState = ghJson(['pr', 'view', String(prNum), '--json', 'state,mergedAt,headRefName']);
   } catch (e) {
-    console.warn('pr view readback failed:', e.message);
+    cwarn('pr view readback failed:', e.message);
     prState = null;
   }
   const outcome = classifyMergeAttempt({ error: mergeErr?.message, pr: prState });
@@ -655,11 +672,11 @@ async function finishMerge(issueNum, prNum) {
             gh(['api', '-X', 'DELETE', `repos/{owner}/{repo}/git/refs/heads/${headBranch}`]);
             log(issueNum, `已清理残留远程分支 ${headBranch}`);
           } catch (e) {
-            console.warn('remote branch cleanup failed:', e.message);
+            cwarn('remote branch cleanup failed:', e.message);
             log(issueNum, `远程分支 ${headBranch} 清理失败（${e.message}）—— 不影响合并结果`);
           }
         }
-      } catch (e) { console.warn('ls-remote failed:', e.message); }
+      } catch (e) { cwarn('ls-remote failed:', e.message); }
     }
     const s = state.load();
     s[issueNum] = mergeIssueState(s[issueNum], { status: 'merged' });
@@ -696,9 +713,9 @@ async function main() {
   if (cmd === 'feedback') {
     // manual gap report: node .agent/pipeline.mjs feedback "<title>" [body]
     const cfg = loadConfig();
-    if (!cfg.upstream) { console.error('no upstream configured in .agent/config.json'); process.exit(2); }
+    if (!cfg.upstream) { cerr('no upstream configured in .agent/config.json'); process.exit(2); }
     if (!cfg.feedbackOptIn && !process.argv.includes('--force')) {
-      console.error('feedbackOptIn=false（如需强制上报加 --force）'); process.exit(2);
+      cerr('feedbackOptIn=false（如需强制上报加 --force）'); process.exit(2);
     }
     const title = process.argv[3] || 'manual gap report';
     const body = process.argv[4] || '(no details provided)';
@@ -708,7 +725,8 @@ async function main() {
   }
 
   if (cmd === 'status') {
-    console.log(JSON.stringify(state.load(), null, 2));
+    // state.json 里的 `error` / `lastError` 是**原始**报错（可能带凭据）→ 终端也要脱敏
+    console.log(redactSecrets(JSON.stringify(state.load(), null, 2)));
     return;
   }
 
@@ -750,14 +768,14 @@ async function main() {
     const raw = iRetry >= 0 ? args[iRetry + 1] : args.find(a => /^#?\d+$/.test(a));
     const issueNum = String(raw ?? '').replace(/^#/, '');
     if (!/^\d+$/.test(issueNum)) {
-      console.error('usage: pipeline.mjs retry --issue <number>   |   pipeline.mjs retry --list');
+      cerr('usage: pipeline.mjs retry --issue <number>   |   pipeline.mjs retry --list');
       process.exit(2);
     }
     // 1) 状态是否可重试 —— 纯判定在任何 gh 调用之前（拒绝时不写状态、离线可测）
     const reset = retryReset(state.load()[issueNum]);
     if (!reset.ok) {
-      console.error(`✗ 拒绝重试 issue #${issueNum}：${reset.reason}`);
-      console.error('  .agent/state.json 未改动。');
+      cerr(`✗ 拒绝重试 issue #${issueNum}：${reset.reason}`);
+      cerr('  .agent/state.json 未改动。');
       process.exit(2);
     }
     // 2) 否决优先 —— 带 agent-rejected 标签的 issue 绝不重试。
@@ -766,13 +784,13 @@ async function main() {
     try {
       issueMeta = ghJson(['issue', 'view', issueNum, '--json', 'number,title,labels,state']);
     } catch (e) {
-      console.error(`✗ 拒绝重试 issue #${issueNum}：无法确认 /reject 标签（${e.message}）`);
-      console.error('  为避免复活已被否决的 issue，本命令 fail-closed，不写状态。请先修复 gh 访问后重试。');
+      cerr(`✗ 拒绝重试 issue #${issueNum}：无法确认 /reject 标签（${e.message}）`);
+      cerr('  为避免复活已被否决的 issue，本命令 fail-closed，不写状态。请先修复 gh 访问后重试。');
       process.exit(2);
     }
     if (isRejectedIssue(issueMeta)) {
-      console.error(`✗ 拒绝重试 issue #${issueNum}：该 issue 带 ${REJECTED_LABEL} 标签（/reject 否决优先）。`);
-      console.error('  .agent/state.json 未改动。如需恢复，请先在 issue 下回复 /approve 解除否决。');
+      cerr(`✗ 拒绝重试 issue #${issueNum}：该 issue 带 ${REJECTED_LABEL} 标签（/reject 否决优先）。`);
+      cerr('  .agent/state.json 未改动。如需恢复，请先在 issue 下回复 /approve 解除否决。');
       process.exit(2);
     }
     // 3) 写状态 + 审计（日志 + issue 评论）
@@ -795,7 +813,7 @@ async function main() {
         st.lastError ? `上次失败原因（已存档）：\`${redactSecrets(String(st.lastError)).replace(/\n/g, ' ').slice(0, 400)}\`` : '',
       ].filter(Boolean).join('\n\n'));
     } catch (e) {
-      console.warn(`[retry] issue #${issueNum} 评论失败（状态已写入，不影响续跑）：${e.message}`);
+      cwarn(`[retry] issue #${issueNum} 评论失败（状态已写入，不影响续跑）：${e.message}`);
     }
     console.log(`✓ issue #${issueNum} 已复位：${st.previousStatus} → ${st.status}（retries=${st.retries}，从「${stage}」继续）`);
     console.log('下一步：');
@@ -809,7 +827,7 @@ async function main() {
     //   node .agent/pipeline.mjs review --pr 12 [--issue 7]
     const pi = process.argv.indexOf('--pr');
     const prNum = pi >= 0 ? process.argv[pi + 1] : null;
-    if (!prNum) { console.error('usage: pipeline.mjs review --pr <number> [--issue <number>]'); process.exit(2); }
+    if (!prNum) { cerr('usage: pipeline.mjs review --pr <number> [--issue <number>]'); process.exit(2); }
     const ii = process.argv.indexOf('--issue');
     const issueNum = ii >= 0 ? process.argv[ii + 1] : 'unknown';
     console.log(`reviewing PR #${prNum} with ${describeModel(REVIEW)}`);
@@ -848,13 +866,13 @@ async function main() {
         continue;
       }
       for (const issue of pending) {
-        console.log(`[${ts()}] ▶ 处理 issue #${issue.number}: ${issue.title}`);
+        console.log(redactSecrets(`[${ts()}] ▶ 处理 issue #${issue.number}: ${issue.title}`));
         try {
           await processIssue(issue);
           console.log(`[${ts()}] ✔ issue #${issue.number} 本轮结束`);
         } catch (err) {
           // one bad issue must NOT kill the long-running watcher
-          console.error(`[${ts()}] ✖ issue #${issue.number} 处理失败，循环继续：${err.message}`);
+          cerr(`[${ts()}] ✖ issue #${issue.number} 处理失败，循环继续：${err.message}`);
           log(issue.number, `循环捕获异常（不退出）:\n${err.stack || err.message}`);
           const sf = state.load();
           if (!sf[issue.number]) sf[issue.number] = {};
@@ -876,7 +894,7 @@ async function main() {
       // transient gh/network failure → backoff and keep watching
       pollFailures += 1;
       const delay = Math.min(300_000, 30_000 * pollFailures);
-      console.error(`[${ts()}] ✖ 轮询失败 (${pollFailures}): ${err.message} — ${delay / 1000}s 后重试`);
+      cerr(`[${ts()}] ✖ 轮询失败 (${pollFailures}): ${err.message} — ${delay / 1000}s 后重试`);
       if (once) throw err;
       await new Promise(r => setTimeout(r, delay));
     }
@@ -889,5 +907,5 @@ export { assertNoSecrets, SECRET_PATTERNS };
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
-  main().catch(e => { console.error(e); process.exit(1); });
+  main().catch(e => { cerr(e); process.exit(1); });
 }
