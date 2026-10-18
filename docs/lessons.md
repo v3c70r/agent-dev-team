@@ -669,3 +669,140 @@ SyntaxError: The requested module './lib.mjs' does not provide an export named '
   列出名字；拼错即报错。**静默跳过 = 假绿**。
 - 环境和代码要分层：`doctor` 面向"装/跑"（全绿口径），`validate` 面向"仓库是否健康"
   （只看仓库类）。同一个脚本同时服务两者时，**必须提供按类裁剪的入口**。
+
+---
+
+## 28. 凭据防线只覆盖了它被写在的地方（→ 改成结构性保证 + 日志脱敏）
+
+**现象**（2026-10-16 事故，提交 `c36aca5`，issue #21 复盘）：一条 PR 评论的正文里
+写着 `$(gh auth token --user <owner>)`，被 shell 展开成**真 OAuth 令牌**并贴进 PR 评论；
+GitHub secret scanning **自动吊销**该令牌 → 之后每个 `gh` 调用 401，整条流水线卡死。
+代价不是"改一下"而是**凭据作废**：已推送的令牌无法收回，只能吊销。
+
+事后加了硬拦截 `assertNoSecrets()`，但只挂在 **3 个调用点**（`commentOnIssue`、
+`commentOnPr`、`pr create --body`）。同一份代码里还有 **7 类出站/落盘路径裸奔**（grep 实测）：
+
+| 位置 | 风险 |
+|---|---|
+| `reportGap()`（上游 feedback，2 处 `issue create`） | **跨仓库公开泄漏**：`err.stack` / 错误原文经 opt-in 发到第三方仓库 `cfg.upstream`；远端 URL 内嵌凭据的 push 报错就会整条发出去 |
+| `gh pr review --approve --body`（2 处） | 同类出站点，正文当时是静态串，但新增字段即失守 |
+| `pm/screen.mjs` 筛选判定评论 | 正文含**模型生成**的 WHY / SCOPE / TESTABILITY / REFINED_TASK |
+| `pm/screen.mjs` `issue edit --body` | 把原正文 + 模型生成内容拼回去**整体覆盖**已发布 issue |
+| `pm/screen.mjs` REJECT/SPLIT 评论 | 同上，含模型生成内容 |
+| `log()` → `.agent/logs/issue-N.md` | 日志**原样落盘** pi/模型输出与异常栈；人类排障时会把日志贴进 issue（lessons #25 的评论损坏事故正是"内容贴来贴去"） |
+| PM 的 `screen-*.md` | 同日志路径 |
+
+**为什么"只加在 3 个地方"必然漏**：防线写在调用点，就要求每个新增出站点的人都
+"记得加"。这类保证会随代码增长而衰减，且衰减是静默的（没有测试会变红）。
+
+**修复（结构性 + 可测 + fail-closed）**：
+
+1. **实现只留一份**：`SECRET_PATTERNS` / `assertNoSecrets` / 新增 `redactSecrets` /
+   `countSecretMatches` 全部移入 `templates/lib.mjs`（无副作用；`pipeline.mjs` 与
+   `pm/screen.mjs` 都已 import lib）。`pipeline.mjs` 保留 `export { assertNoSecrets,
+   SECRET_PATTERNS }` 兼容既有引用。
+2. **规则二分**（两个 helper，不是一个）：
+   - **硬拦截**（`assertNoSecrets` throw）= agent **自己撰写**的正文：pipeline 评论、
+     PR 正文、`pr review` 正文。宁可不发一条评论，也不泄漏。
+   - **脱敏后发送**（`redactSecrets`）= **必须留下审计记录**的通道：上游 feedback、
+     筛选判定评论、`issue edit --body`、本地日志。凭据必须去掉，但判定本身
+     **绝不能因检测到凭据而丢失**，否则审计断链。脱敏命中时留痕
+     （"已自动脱敏 N 处疑似凭据" / `[_已脱敏 N 处_]`），人类能看出这里被处理过。
+3. **`log()` 单点收口**：一个函数覆盖 pi 输出、review 输出、retry 日志、循环异常栈 →
+   一次改动覆盖所有日志路径，不需要在每个 `log()` 调用点重复。
+4. **lint 变成断言**：`scripts/validate.mjs` 7e 要求 `templates/pipeline.mjs` 与
+   `templates/pm/screen.mjs` 里**每个** `'--body'` 所在行同时出现 `assertNoSecrets(` 或
+   `redactSecrets(`；`templates/prompts/*.md`、`templates/pm/*.md` 中不得出现 `--body "`。
+   新增出站点不包裹 → `npm test` 红（已实测：去掉一处包裹即 2 FAILURE）。
+5. **修掉自相矛盾的提示词**：`templates/prompts/reviewer.md` 一边禁止双引号正文，
+   一边示范 `gh pr comment <PR#> --body "…"`；`pm/prompt.md` 同样用
+   `--body "$(cat <<'EOF' …)"`。全部改成 `--body-file`（正文先写文件），并补一句
+   "正文需引用命令输出时先写文件；出现 `$(`/反引号/令牌形状一律不直接发送"。
+   旧的 7b 检查只 grep "文件里存在 `--body-file` 字样"，所以矛盾示范能长期存活 ——
+   断言必须**同时禁止坏写法**，否则它只证明"好写法出现过"。
+
+**外部共识（同类实践）**：
+
+- GitHub push protection / secret scanning 会在**已推送**后吊销凭据 → 必须**发送前**拦截。
+  https://docs.github.com/en/code-security/secret-scanning/introduction/about-push-protection
+- gitleaks 的定位即 "detect secrets **before** they get committed/pushed" —— 前置扫描是成熟模式。
+  https://github.com/gitleaks/gitleaks
+- 脱敏必须**覆盖日志**并且**可测 / fail-closed**（IRLight #468 脱敏日志检查 false-negative、
+  #481 secret diagnostics 必须 fail-closed）。
+  https://github.com/azumag/IRLight/issues/468 · https://github.com/azumag/IRLight/issues/481
+- https://owasp.org/www-project-top-10-for-large-language-model-applications/（敏感信息泄漏，输出侧同样要治理）
+
+**教训**：
+
+- **安全防线要写成"结构性保证"，不是"记得加"**：共享 helper + 静态 lint 断言，
+  让遗漏变成红测试，而不是变成事故。
+- **拦截与脱敏是两个不同承诺**，混用会两头坏：全拦 → 审计记录丢失；
+  全脱敏 → agent 自己写的正文里带着凭据继续流动。按"这条通道能不能丢"二分。
+- **日志是出站点**。最容易被人类触碰的路径（把日志贴进 issue）必须默认脱敏。
+- **示例即文档**：提示词里的示范会被模型照抄。禁令与示范矛盾时，模型学的是示范。
+- **可测性就是可信度**：`redactSecrets` 做纯函数（幂等、只留 4 位前缀、正常文本零误报），
+  `reportGap` / `log()` 用假 `gh` + 临时仓库跑真实 pipeline 断言 —— 不靠"看起来对了"。
+
+**已知边界（本 PR 不做）**：不拦截模型自己在 bash 里跑出的 `gh` 调用（代码不可控，
+只能靠提示词）；不引入第三方扫描器。
+
+**补漏（Agent B review 第 1 轮，同类出口仍有两处）**：
+
+- **`docs/proposal-audit.md` 是最硬的出站点**：它不只是"发一条评论"——它被
+  `git add` + `git commit` + `git push HEAD:<BASE>` 写进**提交历史**（评论能删，历史删不掉）。
+  内容来自模型生成的 WHY / SPLIT_PLAN 与外部 issue 标题。修法：在拼每条记录的
+  **唯一入口** `one()` 里套 `redactSecrets`（single choke point），命中则在日志留痕
+  「已脱敏 N 处」。断言：validate 7g 用假 `gh`/`git`/`pi` 跑**真实** `screen.mjs`，
+  假 pi 故意在 WHY 里吐令牌 → 断言**被 push 的那份文件**（假 `git push` 会把它拷出来）
+  与判定评论、终端输出均无完整令牌。去掉 `one()` 里的脱敏 → `npm test` 立刻红。
+- **`retry --list` 是终端出站点**：`state.error` 是**原始**报错（远端 URL 内嵌凭据的
+  push 失败），`formatRetryList()` 原样打到终端 = tmux 窗格 / CI 日志 / 截图泄漏。
+  修法：在**纯函数内部**脱敏（所有调用方自动安全），断言在 validate 16b-2。
+- 同类顺手：`pipeline.mjs review --pr` 打印的模型输出尾巴、`screen.mjs --check` 的 JSON
+  也过 `redactSecrets`；`retry` 评论里的 `lastError` 先脱敏再发（审计通道不能因命中凭据
+  整条丢失，`commentOnIssue` 内部仍会硬拦残留令牌）。
+
+**这一轮真正的教训**：**"出站点清单"不是一次列全的**。第一轮把 9 处列成表仍然漏了
+`proposal-audit.md`（写入后进提交历史）和 `retry --list`（终端），因为清单是**按代码位置**
+枚举的，而风险是**按"数据最终到哪里"**定义的。可复用的判定方法：对每条出站路径问三句——
+① 内容里有没有模型生成/外部输入？② 它最终落到哪（评论 / issue 正文 / **提交历史** /
+终端 / 日志文件）？③ 落错之后能不能撤销？**"不能撤销"的那类（提交历史）优先级最高。**
+
+**补漏 2（Agent B review 第 2 轮）：终端诊断输出没脱敏**
+
+`sh()` 用 `execFileSync`，它把**子进程 stderr 原文拼进 `e.message`** —— 也就是说
+"远端 URL 内嵌凭据的 push/merge/api 报错"会随着 `e.message` 一起流动。上一轮已经把
+`log()`（文件）脱敏了，但 `console.warn/console.error`（终端，13 处 + `main().catch` 打完整
+stack）还是裸的 —— 而终端恰是 **tmux 窗格 / CI 日志 / 截图** 的入口，也是 lessons #25
+「内容贴来贴去」的起点。`reportGap()` 早就在用"错误原文可能带凭据"这条论证给自己脱敏，
+同一份文件里却没把这条论证应用到终端，这就是**同一主题上的不一致**。
+
+修法（模块级单一收口，成本最小、覆盖面最大）：
+
+```js
+function scrub(v) { return v instanceof Error ? redactSecrets(v.stack || v.message) : redactSecrets(String(v)); }
+function cwarn(...args) { process.stderr.write(args.map(scrub).join(' ') + '\n'); }
+function cerr(...args) { process.stderr.write(args.map(scrub).join(' ') + '\n'); }
+```
+
+`pipeline.mjs` 里所有 `console.warn/error`（含 `main().catch`）改用 `cwarn/cerr`；
+`status` 打印的 `state.json`、watch 循环打印的 issue 标题也过 `redactSecrets`。
+
+断言（都会变红）：
+
+- validate **7e-2** 静态 lint：`templates/pipeline.mjs` 不得出现**裸 `console.warn/error(`**
+  （handler 自身除外，所以收口点用 `process.stderr.write` 实现），且必须存在
+  `function cwarn(` / `function cerr(`、使用点 ≥10、`main().catch` 必须走 `cerr`。
+- validate **7h** 端到端：假 `gh`/`git` 往 stderr 写带令牌的"远端 URL 内嵌凭据"报错，
+  分别跑 `retry`（`cerr(e.message)`）、`run`（`main().catch` 打完整 stack）、`status`
+  （state.json 里的原始 error）、`feedback`（`cwarn` 路径），断言 stdout+stderr 均无完整令牌。
+  这里必须用 `spawnSync` 而不是 `execFileSync`：**后者在成功退出时不返回 stderr**，
+  会让断言变成假绿（本轮实测踩到：`cwarn` 那条一直是"通过"的）。
+
+**教训**：
+
+- **"脱敏了文件日志"不等于"脱敏了错误"**：同一条字符串有多个出口（文件 / 终端 / 评论 /
+  提交历史），每个出口都要单独收口；收口方式优先选**模块级 wrapper**，而不是逐点改。
+- **断言要拿到真正的那条流**：`execFileSync` 成功路径看不到 stderr、`console.warn` 走的是
+  stderr —— 测试工具选错会让"我加了断言"变成"我加了永不失败的断言"。写完断言**必须做
+  一次负向验证**（去掉修复 → 断言变红），否则不知道它到底在测什么。

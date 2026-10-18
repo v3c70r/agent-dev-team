@@ -85,6 +85,31 @@ pr_open  ─ retry → 拒绝（无需重试）
 （detached HEAD 下 `--delete-branch` 会「先合并、后报错」），合并前会 best-effort 切回 `BASE`；
 读不到状态则 fail-closed（`needs_human`）；合并成功后尽力清理残留的远程分支（lesson #24）。
 
+## 出站正文与日志的凭据防线（issue #21）
+
+事故前提：GitHub push protection / secret scanning 会吊销**已推送**的令牌 —— 不能
+“发错了再删”，只能**发送前**拦住（docs/lessons.md #28）。因此所有**代码可控**的
+出口分两类处理，实现只住在 `lib.mjs` 一份：
+
+| 出口 | 规则 | helper |
+|---|---|---|
+| issue/PR 评论、PR 正文、`pr review --body`（agent 自己撰写） | **硬拦截**（`throw`，不发） | `assertNoSecrets()` |
+| 上游 `[skill-feedback]` 的 title+body（跨仓库） | 脱敏后发送 + 附“已脱敏 N 处” | `redactSecrets()` |
+| 筛选判定评论 / `issue edit --body`（审计通道） | 脱敏后发送（判定不能丢） | `redactSecrets()` |
+| `docs/proposal-audit.md`（`git commit` + `push` 到 BASE，**进提交历史**） | 脱敏后写入（最硬的出口） | `redactSecrets()` 在 `one()` |
+| 本地日志 `.agent/logs/issue-<N>.md`、`pm/logs/screen-*.md` | 落盘前脱敏（`log()` 单点收口） | `redactSecrets()` |
+| `retry --list` / `review --pr` 尾输出 / `--check` / `status` JSON（终端） | 终端也是出口（tmux / CI 日志 / 截图） | `formatRetryList()` 内部 + `console.log(redactSecrets(...))` |
+| 所有诊断输出（`console.warn/error` 的 `e.message` / stack） | **模块级单一收口**：`sh()` 把 stderr 原文拼进 `e.message`，不得裸打终端 | pipeline 的 `cwarn()` / `cerr()`（validate 7e-2 禁裸 `console.warn/error`） |
+
+为什么不是一个函数：全拦会把审计记录（筛选判定、上游反馈）一并丢掉 → 审计断链；
+全脱敏又会让 agent 自己写的正文带着凭据继续流动。按“这条通道能不能丢”二分。
+
+保证是**结构性**的：`scripts/validate.mjs` 7e 要求每个 `'--body'` 调用点同一行出现
+`assertNoSecrets(` 或 `redactSecrets(`，且提示词文件不得再出现 `--body "` 示范；
+7d/7f 用离线 import + 假 `gh` 跑真实 pipeline 验证“脱敏后不含完整令牌 / 二次脱敏不变 /
+`assertNoSecrets(redactSecrets(x))` 放行”。
+已知边界：模型自己在 bash 里跑的 `gh` 调用不在代码控制内（只靠提示词约束）。
+
 ## 共享记忆
 
 | 介质 | 内容 | 谁能读 |

@@ -35,8 +35,12 @@ Discussion protocol:
 - **Do NOT comment on already-settled PRs**: if the PR is merged/closed, or you have
   already approved it and there are no new commits since, stop immediately, reply
   with your verdict and do not post any comment (avoids noise on merged PRs).
-- If changes are needed, post ONE consolidated comment per review round on the PR with concrete, actionable bullets:
-  `gh pr comment <PR#> --body "…"`
+- If changes are needed, post ONE consolidated comment per review round on the PR with concrete, actionable bullets.
+  Write the body to a file FIRST, then send it — never inline the body in double quotes:
+  `gh pr comment <PR#> --body-file /tmp/review-body.md`
+  If the body must quote command output, redirect that output into the file first
+  (`cmd > /tmp/review-body.md`) and send with `--body-file`; 正文里一旦出现 `$(`、
+  反引号或令牌形状（`ghp_`/`gho_`/`github_pat_`/`sk-`…）**一律不直接发送**
   Then reply exactly: `RESULT: REQUEST_CHANGES`
 - If the code is acceptable, post a short approval summary comment and reply exactly: `RESULT: APPROVE`
 
