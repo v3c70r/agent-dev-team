@@ -745,3 +745,25 @@ GitHub secret scanning **自动吊销**该令牌 → 之后每个 `gh` 调用 40
 
 **已知边界（本 PR 不做）**：不拦截模型自己在 bash 里跑出的 `gh` 调用（代码不可控，
 只能靠提示词）；不引入第三方扫描器。
+
+**补漏（Agent B review 第 1 轮，同类出口仍有两处）**：
+
+- **`docs/proposal-audit.md` 是最硬的出站点**：它不只是"发一条评论"——它被
+  `git add` + `git commit` + `git push HEAD:<BASE>` 写进**提交历史**（评论能删，历史删不掉）。
+  内容来自模型生成的 WHY / SPLIT_PLAN 与外部 issue 标题。修法：在拼每条记录的
+  **唯一入口** `one()` 里套 `redactSecrets`（single choke point），命中则在日志留痕
+  「已脱敏 N 处」。断言：validate 7g 用假 `gh`/`git`/`pi` 跑**真实** `screen.mjs`，
+  假 pi 故意在 WHY 里吐令牌 → 断言**被 push 的那份文件**（假 `git push` 会把它拷出来）
+  与判定评论、终端输出均无完整令牌。去掉 `one()` 里的脱敏 → `npm test` 立刻红。
+- **`retry --list` 是终端出站点**：`state.error` 是**原始**报错（远端 URL 内嵌凭据的
+  push 失败），`formatRetryList()` 原样打到终端 = tmux 窗格 / CI 日志 / 截图泄漏。
+  修法：在**纯函数内部**脱敏（所有调用方自动安全），断言在 validate 16b-2。
+- 同类顺手：`pipeline.mjs review --pr` 打印的模型输出尾巴、`screen.mjs --check` 的 JSON
+  也过 `redactSecrets`；`retry` 评论里的 `lastError` 先脱敏再发（审计通道不能因命中凭据
+  整条丢失，`commentOnIssue` 内部仍会硬拦残留令牌）。
+
+**这一轮真正的教训**：**"出站点清单"不是一次列全的**。第一轮把 9 处列成表仍然漏了
+`proposal-audit.md`（写入后进提交历史）和 `retry --list`（终端），因为清单是**按代码位置**
+枚举的，而风险是**按"数据最终到哪里"**定义的。可复用的判定方法：对每条出站路径问三句——
+① 内容里有没有模型生成/外部输入？② 它最终落到哪（评论 / issue 正文 / **提交历史** /
+终端 / 日志文件）？③ 落错之后能不能撤销？**"不能撤销"的那类（提交历史）优先级最高。**

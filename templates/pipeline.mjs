@@ -790,7 +790,9 @@ async function main() {
       commentOnIssue(issueNum, [
         `🔁 **已由人工请求重试**（第 ${st.retries} 次）：\`${st.previousStatus}\` → \`${st.status}\``,
         `将从「${stage}」继续。`,
-        st.lastError ? `上次失败原因（已存档）：\`${String(st.lastError).replace(/\n/g, ' ').slice(0, 400)}\`` : '',
+        // lastError 是**原始**报错（可能带远端 URL 内嵌凭据）：这是审计通道，脱敏后发，
+        // 不因命中凭据而丢掉整条评论（commentOnIssue 内部仍会硬拦残留令牌）。
+        st.lastError ? `上次失败原因（已存档）：\`${redactSecrets(String(st.lastError)).replace(/\n/g, ' ').slice(0, 400)}\`` : '',
       ].filter(Boolean).join('\n\n'));
     } catch (e) {
       console.warn(`[retry] issue #${issueNum} 评论失败（状态已写入，不影响续跑）：${e.message}`);
@@ -813,7 +815,8 @@ async function main() {
     console.log(`reviewing PR #${prNum} with ${describeModel(REVIEW)}`);
     const { verdict, out } = await runReviewRound(issueNum, prNum);
     console.log(`\nVERDICT: ${verdict}\n`);
-    console.log(out.split('\n').slice(-20).join('\n'));
+    // 模型输出尾已过 `log()` 脱敏；这里直接打终端，所以同样要脱敏（同一类出站点）。
+    console.log(redactSecrets(out.split('\n').slice(-20).join('\n')));
     return;
   }
 

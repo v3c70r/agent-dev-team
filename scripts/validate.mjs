@@ -292,6 +292,114 @@ const lintBodyCallSites = (src) => {
   }
 }
 
+// 7g) **`docs/proposal-audit.md` 是硬出站点**（Agent B review #1）：它被 `git commit` +
+//     `git push HEAD:<BASE>` 写进**提交历史**（不允许“发错了再删”）。W写入内容来自模型生成的
+//     WHY / SPLIT_PLAN 与外部 issue 标题。这里跑**真实** `screen.mjs`（假 `gh`/`git`/`pi`，
+//     离线）：假 pi 在 WHY 里吐令牌 → 断言**被 push 的那份文件**与终端输出均无完整令牌。
+{
+  const TOKA = 'ghp_' + 'Ab1'.repeat(8);   // 24 位，命中 GitHub PAT 形态
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'agent-audit-'));
+  try {
+    mkdirSync(path.join(tmp, '.agent/pm'), { recursive: true });
+    copyFileSync(path.join(ROOT, 'templates/pm/screen.mjs'), path.join(tmp, '.agent/pm/screen.mjs'));
+    copyFileSync(path.join(ROOT, 'templates/lib.mjs'), path.join(tmp, '.agent/lib.mjs'));
+    copyFileSync(path.join(ROOT, 'templates/pm/screener.md'), path.join(tmp, '.agent/pm/screener.md'));
+    writeFileSync(path.join(tmp, '.agent/config.json'), JSON.stringify({ screenAutoApprove: false }, null, 2));
+    const bin = path.join(tmp, 'bin');
+    mkdirSync(bin, { recursive: true });
+    const capture = path.join(tmp, 'pushed-audit.md');
+    const ghLog = path.join(tmp, 'gh-calls.log');
+    writeFileSync(ghLog, '');
+
+    // 假 gh：label create / issue list → 空；issue view → 给定 issue；comment/edit/close → 记下参数
+    writeFileSync(path.join(bin, 'gh'), [
+      '#!/usr/bin/env node',
+      'const a = process.argv.slice(2);',
+      "const fs = require('node:fs');",
+      "const rec = () => fs.appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify(a) + '\\n');",
+      "if (a[0] === 'label') process.exit(0);",
+      "if (a[0] === 'issue' && a[1] === 'list') { process.stdout.write('[]'); process.exit(0); }",
+      "if (a[0] === 'issue' && a[1] === 'view') { process.stdout.write(process.env.FAKE_GH_ISSUE); process.exit(0); }",
+      "if (a[0] === 'issue' && ['comment','edit','close'].includes(a[1])) { rec(); process.exit(0); }",
+      'process.exit(1);',
+      '',
+    ].join('\n'));
+
+    // 假 pi：返回一份 REJECT 的筛选结果，WHY 里**故意**带令牌（模拟模型复述提案原文/报错）
+    writeFileSync(path.join(bin, 'pi'), [
+      '#!/usr/bin/env node',
+      'process.stdout.write([',
+      "  'WHY: 提案正文里贴了 ' + process.env.FAKE_TOK + ' 这种令牌示例，属于凭据泄露风险。',",
+      "  'SCOPE: templates/lib.mjs',",
+      "  'TESTABILITY: 离线断言',",
+      "  'RESULT: REJECT',",
+      "].join('\\n') + '\\n');",
+      'process.exit(0);',
+      '',
+    ].join('\n'));
+
+    // 假 git：worktree add 建目录；push 时把待推送的 audit 文件**拷出来**（WT 会被 finally 删掉）
+    writeFileSync(path.join(bin, 'git'), [
+      '#!/usr/bin/env node',
+      'const a = process.argv.slice(2);',
+      "const fs = require('node:fs'); const p = require('node:path');",
+      "if (a[0] === 'worktree' && a[1] === 'add') { fs.mkdirSync(a[3], { recursive: true }); process.exit(0); }",
+      "if (a[0] === 'push') {",
+      "  const f = p.join(process.cwd(), 'docs/proposal-audit.md');",
+      "  if (fs.existsSync(f)) fs.writeFileSync(process.env.FAKE_GIT_CAPTURE, fs.readFileSync(f));",
+      '  process.exit(0);',
+      '}',
+      "if (['fetch','add','commit','rebase','worktree','rev-parse','symbolic-ref','ls-remote','-c'].includes(a[0])) process.exit(0);",
+      'process.exit(1);',
+      '',
+    ].join('\n'));
+    for (const f of ['gh', 'pi', 'git']) chmodSync(path.join(bin, f), 0o755);
+
+    const issueJson = JSON.stringify({ number: 42, title: `提案：日志里出现 ${TOKA} 的处置`, body: `正文也带 ${TOKA}`, labels: [] });
+    let stdout = '';
+    let code = 0;
+    try {
+      stdout = execFileSync('node', [path.join(tmp, '.agent/pm/screen.mjs'), '--issue', '42', '--force'], {
+        cwd: tmp, encoding: 'utf8', stdio: 'pipe',
+        env: {
+          ...process.env,
+          PATH: bin + path.delimiter + (process.env.PATH || ''),
+          PI_BIN: path.join(bin, 'pi'),
+          FAKE_GH_ISSUE: issueJson,
+          FAKE_GH_LOG: ghLog,
+          FAKE_GIT_CAPTURE: capture,
+          FAKE_TOK: TOKA,
+        },
+      });
+    } catch (e) { code = e.status ?? 1; stdout = String(e.stdout || '') + String(e.stderr || ''); }
+
+    const problems = [];
+    if (code !== 0) problems.push(`screen.mjs exit ${code}: ${stdout.split('\n').slice(-3).join(' ')}`);
+    if (!existsSync(capture)) problems.push('没有捕获到被 push 的 docs/proposal-audit.md（recordRejection 未走到推送）');
+    else {
+      const audit = readFileSync(capture, 'utf8');
+      if (audit.includes(TOKA)) problems.push('docs/proposal-audit.md（提交历史）含完整令牌');
+      if (!audit.includes('<redacted:ghp_>')) problems.push('audit 未见脱敏标记');
+      if (!/^## REJECT/m.test(audit) || !/- \d{4}-\d{2}-\d{2} \| #42 \|/.test(audit)) problems.push('audit 条目结构被破坏:`n' + audit.slice(0, 200));
+    }
+    if (stdout.includes(TOKA)) problems.push('screen.mjs 终端输出（/日志）含完整令牌');
+    if (!/已脱敏/.test(stdout)) problems.push('脱敏命中时未在日志里留痕「已脱敏 N 处」');
+    const ghCalls = readFileSync(ghLog, 'utf8').split('\n').filter(Boolean);
+    if (ghCalls.some(l => l.includes(TOKA))) problems.push('出站 gh 调用（评论/正文）含完整令牌');
+    const commentCall = ghCalls.map(l => JSON.parse(l)).find(a => a[0] === 'issue' && a[1] === 'comment');
+    if (!commentCall) problems.push('未发出判定评论（筛选判定不能丢）');
+    else if (!commentCall.join(' ').includes('<redacted:')) problems.push('判定评论未见脱敏标记');
+
+    problems.length
+      ? fail(`审计出站脱敏 (7g): ${problems.join('; ')}`)
+      : ok('审计出站脱敏 (7g): recordRejection 推送到 BASE 的 docs/proposal-audit.md（及判定评论/终端）无完整令牌');
+  } catch (e) {
+    fail(`审计出站脱敏 (7g): ${e.message}`);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 // 8. doctor dogfood self-check: `npm run doctor` must be green in THIS repo
 // (its stdout is reused by check 11 so we only pay for the slow model probe once)
 //
@@ -774,6 +882,20 @@ let doctorHumanOut = '';
     if (lines.length !== 2 || !lines[0].startsWith('#7') || !lines[1].startsWith('#12')) miss.push(`排序/条数异常: ${JSON.stringify(lines)}`);
     if (lib.formatRetryList({}).length !== 0) miss.push('空状态应返回空列表');
     miss.length ? fail(`formatRetryList: ${miss.join('; ')}`) : ok('formatRetryList: 只列 needs_human/failed（按 issue 号排序，error 压平）');
+
+    // 16b-2) `retry --list` 是**终端出站点**（Agent B review #2）：`state.error` 常是原始
+    //        报错（远端 URL 内嵌凭据的 push 失败）→ 原样打终端就是 tmux 窗格/CI 日志泄漏。
+    const TOKR = 'gho_' + 'T0k'.repeat(8);   // 24 位，命中 GitHub token 形态
+    const missTok = [];
+    const rawErr = `push failed for https://${TOKR}@github.com/acme/x`;
+    const withTok = lib.formatRetryList({ 8: { status: 'needs_human', pr: 1, error: rawErr } }).join('\n');
+    if (withTok.includes(TOKR)) missTok.push('--list 行含完整令牌（终端/CI 日志泄漏）');
+    if (!withTok.includes('<redacted:')) missTok.push('--list 行未见脱敏标记');
+    if (!withTok.includes('error=push failed for https://<redacted:gho_>@github.com/acme/x')) missTok.push(`脱敏破坏了行格式: ${withTok}`);
+    if (lib.formatRetryList({ 8: { status: 'needs_human', error: 'plain error' } }).join('') !== '#8 needs_human pr=- retries=0 error=plain error') missTok.push('正常 error 文本被改动');
+    missTok.length
+      ? fail(`formatRetryList 脱敏: ${missTok.join('; ')}`)
+      : ok('formatRetryList 脱敏: retry --list 不再把 state.error 里的令牌打到终端');
   }
 
   // 16c. pipeline 的 retry 分支：走纯函数、否决优先、拒绝即 exit 2、绝不 force

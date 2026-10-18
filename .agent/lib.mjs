@@ -119,6 +119,10 @@ export function retryReset(prev) {
 }
 
 /** Human-readable one-liner per stuck entry (for `pipeline.mjs retry --list`). */
+// `retry --list` 也是出站点（issue #21 / Agent B review #1）：state.error 常是**原始**报错
+// （远端 URL 内嵌凭据的 push 失败、带令牌的 API 报错），原样打到终端就是 tmux 窗格 /
+// CI 日志 / 截图泄漏 —— 正是 lessons #25「内容贴来贴去」的路径。
+// 在纯函数内部脱敏，保证所有调用方（含未來的）都不会把这行原始错误打出去。
 export function formatRetryList(state = {}) {
   const lines = [];
   for (const key of Object.keys(state || {})) {
@@ -127,7 +131,7 @@ export function formatRetryList(state = {}) {
     const num = Number(key);
     const err = prev.error === undefined || prev.error === null || prev.error === ''
       ? '-'
-      : String(prev.error).replace(/\s+/g, ' ').slice(0, 120);
+      : redactSecrets(String(prev.error)).replace(/\s+/g, ' ').slice(0, 120);
     lines.push({ n: Number.isFinite(num) ? num : Infinity, text: `#${key} ${prev.status} pr=${prev.pr ?? '-'} retries=${prev.retries || 0} error=${err}` });
   }
   return lines.sort((a, b) => a.n - b.n).map(l => l.text);

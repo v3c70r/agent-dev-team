@@ -130,10 +130,20 @@ function recordRejection(verdict, issue, why, splitPlan) {
     const f = path.join(WT, 'docs', 'proposal-audit.md');
     mkdirSync(path.dirname(f), { recursive: true });
     const date = new Date().toISOString().slice(0, 10);
-    const one = (t) => String(t || '').replace(/\s+/g, ' ').replace(/\|/g, '/').trim().slice(0, 300);
+    // `docs/proposal-audit.md` 是**已跟踪文件**，并且会被 commit + push 到 BASE —— 这是
+    // 最硬的出站点（评论能删，提交历史删不掉）：模型生成的 `why` / `splitPlan` 与外部输入的
+    // `issue.title` 都可能带上令牌形状（例如提案正文里贴了 `ghp_…` 示例，或模型复述了带
+    // 凭据的 URL 报错）。所以在**拼每条记录的唯一入口** `one()` 里脱敏（single choke point）。
+    // 审计记录本身必须留下（它是 PM 的否决记忆）→ 脱敏后写入，不拦截（lessons #28）。
+    const one = (t) => redactSecrets(String(t || '')).replace(/\s+/g, ' ').replace(/\|/g, '/').trim().slice(0, 300);
     const line = verdict === 'SPLIT'
       ? `- ${date} | #${issue.number} | ${one(issue.title)} | 拆分建议: ${one(splitPlan) || '(见关闭评论)'}\n`
       : `- ${date} | #${issue.number} | ${one(issue.title)} | ${one(why)}\n`;
+    const hidden = countSecretMatches(line);
+    if (hidden) log(`⚠️ #${issue.number} 审计条目残留 ${hidden} 处令牌特征（不应发生，请检查 one()）`);
+    else if (countSecretMatches(`${issue.title || ''} ${why || ''} ${splitPlan || ''}`)) {
+      log(`⚠️ #${issue.number} 审计条目命中疑似凭据 → 已脱敏后写入 docs/proposal-audit.md`);
+    }
 
     const HEADER = `# Proposal audit（筛选器维护 / append-only）\n\n` +
       `<!-- 由 .agent/pm/screen.mjs 自动写入，请勿手工编辑。\n` +
@@ -202,7 +212,7 @@ function screenOne(issue, budgetLeft) {
     const hidden = countSecretMatches(body);
     const safeBody = redactSecrets(body);
     if (hidden) log(`⚠️ #${issue.number} 判定正文命中 ${hidden} 处疑似凭据 → 已脱敏后发送`);
-    gh(['issue', 'comment', String(issue.number), '--body', redactSecrets(safeBody)]);
+    gh(['issue', 'comment', String(issue.number), '--body', redactSecrets(body)]);
     // 把收紧后的任务追加到正文，确保 Agent A 读到
     if (refined) {
       const marker = '<!-- agent-screener -->';
@@ -237,7 +247,9 @@ function main() {
 
   if (CHECK) {
     const pending = ISSUE ? [{ number: ISSUE, title: '(forced)' }] : (() => { try { return pendingProposals(); } catch { return []; } })();
-    console.log(JSON.stringify({
+    // `--check` 也是出站点（终端/CI 日志）：虽然当前只含编号与模型名，但它是发给人类的
+    // 诊断输出，未来加字段会把外部内容带出去 —— 统一脱敏零成本（Agent B review 次要项）。
+    console.log(redactSecrets(JSON.stringify({
       pending: pending.map(p => '#' + p.number),
       awaitingScreening: pending.length,
       autoApprove: AUTO,
@@ -246,7 +258,7 @@ function main() {
       autoBudgetLeft: budgetLeft,
       model: `${SCREEN.provider}/${SCREEN.model}`,
       base: BASE,
-    }, null, 2));
+    }, null, 2)));
     return;
   }
 
