@@ -76,6 +76,7 @@ pi 会按 [`SKILL.md`](SKILL.md) 的步骤：做 preflight 检查 → 询问你�
 | `REVIEW_PROVIDER` / `REVIEW_MODEL` | `zai-coding-cn` / `glm-5.3` | Agent B 使用的模型（建议与实现模型不同厂商） |
 | `IMPL_PROVIDER` / `IMPL_MODEL` | 空（用 pi 默认） | Agent A 使用的模型 |
 | `MAX_REVIEW_ROUNDS` | 3 | 审查修改轮数上限 |
+| `MODEL_COOLDOWN_MIN` | 30 | 审查模型报错**解析不出重置时间**时的默认冷却（分钟）；冷却记录在 `.agent/model-health.json`（删该文件即可提前清除，见 lessons #29） |
 | `MAX_TEST_FIXES` | 2 | 测试失败后的修复轮数上限 |
 | `TEST_SKIP` | — | `=1` 跳过功能测试（演示用） |
 | `TEST_ENV_FILE` | 仓库 `.env` | 测试所需密钥的 env 文件路径（supervisor 自动注入） |

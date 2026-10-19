@@ -1114,5 +1114,405 @@ let doctorHumanOut = '';
   }
 }
 
+// 17. 模型不可用是「有截止时间的事实」（issue #25）
+//     真实事故：主审查模型返回
+//     `429 {"code":"1310","message":"…您的限额将在 2026-10-19 07:47:19 重置。"}`
+//     回退生效了，但没有**记忆**：每个审查轮都重试一次已死的模型（PR #22 上 3 条
+//     一模一样的 ⚠️ 评论）、上游两条同标题 feedback（#23/#24）、日志把回退轮记成主模型。
+//     这里锁住四件事：解析重置时间 / 冷却跳过 / 一次中断只上报一次 / 如实记账。
+{
+  const RESET_ERR = '429: {"code":"1310","message":"您已达到每周/每月使用上限，您的限额将在 2026-10-19 07:47:19 重置。"}';
+  const problems = [];
+
+  // 17a. 纯函数：parseModelResetAt / shouldUsePrimary（不修改入参）
+  if (typeof lib.parseModelResetAt !== 'function' || typeof lib.shouldUsePrimary !== 'function') {
+    fail('templates/lib.mjs 缺少 parseModelResetAt() / shouldUsePrimary()');
+  } else {
+    const now = new Date('2026-10-18T17:00:00Z');
+    const nowMs = now.getTime();
+    const LO = nowMs + 5 * 60_000;
+    const HI = nowMs + 7 * 864e5;
+    const inRange = (iso) => Number.isFinite(Date.parse(iso)) && Date.parse(iso) >= LO && Date.parse(iso) <= HI;
+
+    // (1) #23/#24 的真实报错原文：必须解析出重置时间，且落在钳制区间内
+    const real = lib.parseModelResetAt(RESET_ERR, now);
+    if (!inRange(real?.until)) problems.push(`真实 429 报错解析出的 until 不在 [now+5min, now+7d] 内: ${JSON.stringify(real)}`);
+    if (real?.kind !== 'reset-at') problems.push(`真实 429 报错解析类型期望 reset-at 实得 ${real?.kind}`);
+    if (Math.abs(Date.parse(real?.until) - Date.parse('2026-10-19T07:47:19Z')) > 0) problems.push(`真实 429 报错应按 UTC 解释为 2026-10-19T07:47:19Z，实得 ${real?.until}`);
+
+    // (2) 相对时间：try again in 20 minutes ≈ now+20min；Retry-After: 120 = now+120s（钳到下限）
+    const rel = lib.parseModelResetAt('service busy, try again in 20 minutes', now);
+    if (rel?.kind !== 'try-again') problems.push(`try-again 类型期望 try-again 实得 ${rel?.kind}`);
+    if (Math.abs(Date.parse(rel?.until) - (nowMs + 20 * 60_000)) > 60_000) problems.push(`try again in 20 minutes 期望 ≈ now+20min 实得 ${rel?.until}`);
+    const ra = lib.parseModelResetAt('HTTP 429 Too Many Requests; Retry-After: 120', now);
+    if (ra?.kind !== 'retry-after') problems.push(`Retry-After 类型期望 retry-after 实得 ${ra?.kind}`);
+    if (Date.parse(ra?.until) < nowMs + 60_000) problems.push(`Retry-After: 120 应至少冷却 1 分钟实得 ${ra?.until}`);
+    const ep = lib.parseModelResetAt('X-RateLimit-Reset: 1760000000', now);
+    if (ep?.kind !== 'epoch-reset') problems.push(`X-RateLimit-Reset 类型期望 epoch-reset 实得 ${ep?.kind}`);
+
+    // (3) 解析不出/已过期 → 默认冷却（默认 30min）与钳制下限（now+5min）
+    const dflt = lib.parseModelResetAt('模型暂时不可用', now);
+    if (dflt?.kind !== 'default') problems.push(`无法解析时期望 kind=default 实得 ${dflt?.kind}`);
+    if (Math.abs(Date.parse(dflt?.until) - (nowMs + 30 * 60_000)) > 60_000) problems.push(`默认冷却期望 ≈ now+30min 实得 ${dflt?.until}`);
+    const past = lib.parseModelResetAt('限额将在 2020-01-01 00:00:00 重置', now);
+    if (Date.parse(past?.until) !== LO) problems.push(`过去时间应钳到 now+5min，实得 ${past?.until}`);
+    const far = lib.parseModelResetAt('reset at 2027-12-31T00:00:00Z', now);
+    if (Date.parse(far?.until) !== HI) problems.push(`超过 7 天的重置时间应钳到 now+7d，实得 ${far?.until}`);
+    const custom = lib.parseModelResetAt('boom', now, { cooldownMin: 90 });
+    if (Math.abs(Date.parse(custom?.until) - (nowMs + 90 * 60_000)) > 60_000) problems.push(`cooldownMin 覆盖未生效: ${custom?.until}`);
+
+    // (4) shouldUsePrimary 真值表（含 hasFallback:false → 恒 true 的安全边界）
+    const healthEntry = { until: real.until, kind: real.kind, reason: 'x', observedAt: now.toISOString() };
+    const entrySnapshot = JSON.stringify(healthEntry);
+    const table = [
+      ['冷却中（#23 真实重置时间）', healthEntry, {}, false],
+      ['冷却中但无回退模型 → 仍用主模型（否则没模型可用）', healthEntry, { hasFallback: false }, true],
+      ['无健康条目', null, {}, true],
+      ['空对象', {}, {}, true],
+      ['until 非法', { until: 'garbage' }, {}, true],
+      ['until 缺失', { kind: 'default' }, {}, true],
+      ['until 已过', { until: new Date(nowMs - 1000).toISOString() }, {}, true],
+      ['until 恰好现在（边界，按已过处理）', { until: now.toISOString() }, {}, true],
+      ['until 未来', { until: new Date(nowMs + 60_000).toISOString() }, {}, false],
+    ];
+    for (const [label, h, opts, expect] of table) {
+      let got;
+      try { got = lib.shouldUsePrimary(h, { now, ...opts }); }
+      catch (e) { problems.push(`shouldUsePrimary(${label}) 抛错: ${e.message}`); continue; }
+      if (got !== expect) problems.push(`shouldUsePrimary(${label}): 期望 ${expect} 实得 ${got}`);
+    }
+    if (JSON.stringify(healthEntry) !== entrySnapshot) problems.push('shouldUsePrimary 修改了入参 health（必须是纯函数）');
+    if (now.toISOString() !== '2026-10-18T17:00:00.000Z') problems.push('parseModelResetAt 修改了入参 now（必须是纯函数）');
+    if (lib.modelCooldownMinutes({}) !== 30 || lib.modelCooldownMinutes({ MODEL_COOLDOWN_MIN: '45' }) !== 45) problems.push('modelCooldownMinutes 默认值/覆盖不对');
+
+    problems.length ? fail(`模型重置时间解析 (17a): ${problems.join('; ')}`)
+      : ok('模型重置时间解析 (17a): #23 真实 429 原文 → reset-at 且落在 [now+5min, now+7d]；try-again/Retry-After/X-RateLimit-Reset/默认/钳制；shouldUsePrimary 真值表（无回退模型恒用主模型）+ 不修改入参');
+  }
+
+  // 17b. 结构性断言：健康检查必须在主模型 runPi 之前 / 成功删条目 / 去重 / 如实记账
+  {
+    const pipe = readFileSync(path.join(ROOT, 'templates/pipeline.mjs'), 'utf8');
+    const miss = [];
+    if (!/function loadModelHealth\(/.test(pipe) || !/function saveModelHealth\(/.test(pipe)) miss.push('缺少 loadModelHealth/saveModelHealth');
+    if (!/process\.env\.MODEL_HEALTH_FILE/.test(pipe)) miss.push('MODEL_HEALTH_FILE 不可用 env 覆盖（测试/多环境无法隔离）');
+    const save = pipe.split('function saveModelHealth(')[1]?.split('\n}')[0] || '';
+    if (!/\.tmp/.test(save) || !/renameSync\(/.test(save)) miss.push('saveModelHealth 不是原子写（应写 .tmp 后 rename）');
+    if (!/mkdirSync\(path\.dirname\(MODEL_HEALTH_FILE\)/.test(save)) miss.push('saveModelHealth 未自动创建目录');
+    const load = pipe.split('function loadModelHealth(')[1]?.split('\n}')[0] || '';
+    if (!/catch \{ return \{\}; \}/.test(load)) miss.push('loadModelHealth 解析失败未按空对象处理（fail-open 到用主模型）');
+    const iHealth = pipe.indexOf('shouldUsePrimary(');
+    const iPrimaryCall = pipe.indexOf('runPi(`agent-review-');
+    if (iHealth === -1) miss.push('runReviewRound 未调用 shouldUsePrimary（冷却不会被跳过）');
+    else if (iPrimaryCall === -1 || iHealth > iPrimaryCall) miss.push('健康检查没有发生在主模型 runPi( 之前');
+    if (!/delete health\[primaryKey\]/.test(pipe)) miss.push('主模型成功后未删除健康条目');
+    if (!/modelWarned/.test(pipe)) miss.push('缺少 modelWarned（每条 PR 每天只警告一次）');
+    if (!/\.reviewedBy\s*=\s*res\.model/.test(pipe)) miss.push('approve 时未写 state[issue].reviewedBy = 实际模型');
+    // Agent B review #1（真实 bug）：审查循环必须在 runReviewRound **之后**重读 state，
+    // 否则随后的 state.save(旧对象)（整文件覆盖）会抹掉刚写的 modelWarned。
+    const loop = pipe.split('for (let r = 0; r < maxRounds; r++) {')[1]?.split('// 3) TEST')[0] || '';
+    const iRun = loop.indexOf('await runReviewRound(');
+    const iReload = loop.indexOf('fresh = state.load()');
+    if (iRun === -1) miss.push('审查循环未调用 runReviewRound（无法断言重读顺序）');
+    else if (iReload === -1 || iReload < iRun) miss.push('审查循环在 runReviewRound 之前 load state → 随后的 save 会覆盖刚写入的 modelWarned（同一条 PR 会每轮重复警告）');
+    if (!/reviewedBy/.test(pipe.split('async function finishMerge(')[1]?.split('\n}')[0] || '')) miss.push('finishMerge 的批准说明未带上审查模型');
+    if (/verdict=\$\{verdict\} \(\$\{source\}, model=\$\{describeModel\(REVIEW\)\}\)/.test(pipe)) miss.push('日志仍把回退轮记成主模型（model= 必须取实际模型）');
+    // reportGap 去重必须在 issue create 之前
+    const gap = pipe.split('function reportGap(')[1]?.split('// ── tiny helpers ──')[0] || '';
+    const iDedupe = gap.indexOf('recent.some(');
+    const iCreate = gap.indexOf("'issue', 'create'");
+    if (iDedupe === -1) miss.push('reportGap 缺少同标题去重（#23/#24 重复上报会重演）');
+    else if (iCreate === -1 || iDedupe > iCreate) miss.push('reportGap 的去重必须发生在 issue create 之前');
+    miss.length ? fail(`模型健康记忆结构 (17b): ${miss.join('; ')}`)
+      : ok('模型健康记忆结构 (17b): 先查健康再 runPi / 成功后删条目 / modelWarned 去重 / reviewedBy 记账 / reportGap 发送前按标题去重');
+  }
+
+  // 17c. 离线端到端：真 pipeline + 假 pi（计数）+ 假 gh（记录出站）+ 临时 MODEL_HEALTH_FILE
+  {
+    const mkHarness = () => {
+      const tmp = mkdtempSync(path.join(os.tmpdir(), 'agent-health-'));
+      mkdirSync(path.join(tmp, '.agent/prompts'), { recursive: true });
+      copyFileSync(path.join(ROOT, 'templates/pipeline.mjs'), path.join(tmp, '.agent/pipeline.mjs'));
+      copyFileSync(path.join(ROOT, 'templates/lib.mjs'), path.join(tmp, '.agent/lib.mjs'));
+      copyFileSync(path.join(ROOT, 'templates/prompts/reviewer.md'), path.join(tmp, '.agent/prompts/reviewer.md'));
+      writeFileSync(path.join(tmp, '.agent/state.json'), '{}');
+      writeFileSync(path.join(tmp, '.agent/config.json'), JSON.stringify({ upstream: 'acme/agent-dev-team', feedbackOptIn: true }, null, 2));
+      const bin = path.join(tmp, 'bin');
+      mkdirSync(bin, { recursive: true });
+      const ghLog = path.join(tmp, 'gh-calls.log');
+      const piLog = path.join(tmp, 'pi-calls.log');
+      writeFileSync(ghLog, ''); writeFileSync(piLog, '');
+      writeFileSync(path.join(bin, 'gh'), [
+        '#!/usr/bin/env node',
+        'const a = process.argv.slice(2);',
+        "const fs = require('node:fs');",
+        "const rec = () => fs.appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify(a) + '\\n');",
+        "if (a[0] === 'issue' && a[1] === 'list') { process.stdout.write(process.env.FAKE_GH_UPSTREAM || '[]'); process.exit(0); }",
+        "if (a[0] === 'issue' && a[1] === 'create') { rec(); process.exit(0); }",
+        "if (a[0] === 'pr' && a[1] === 'comment') { rec(); process.exit(0); }",
+        "if (a[0] === 'issue' && a[1] === 'comment') { rec(); process.exit(0); }",
+        'process.exit(1);',
+        '',
+      ].join('\n'));
+      chmodSync(path.join(bin, 'gh'), 0o755);
+      // 假 pi：记录 (provider, model)；主模型（含 glm）在 FAKE_PI_MODE!=ok 时失败，
+      // stderr 里是 #23 的真实额度报错原文（stdout 必须为空，否则 runPi 会当成功）
+      writeFileSync(path.join(bin, 'pi'), [
+        '#!/usr/bin/env node',
+        "const fs = require('node:fs');",
+        'const a = process.argv.slice(2);',
+        "const model = a[a.indexOf('--model') + 1] || '(default)';",
+        "const provider = a[a.indexOf('--provider') + 1] || '(default)';",
+        "fs.appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify({ provider, model }) + '\\n');",
+        "if (process.env.FAKE_PI_MODE !== 'ok' && String(model).includes('glm')) {",
+        "  process.stderr.write(process.env.FAKE_PI_ERR + '\\n');",
+        '  process.exit(1);',
+        '}',
+        "process.stdout.write('RESULT: APPROVE\\n');",
+        'process.exit(0);',
+        '',
+      ].join('\n'));
+      chmodSync(path.join(bin, 'pi'), 0o755);
+      return { tmp, bin, ghLog, piLog, healthFile: path.join(tmp, 'model-health.json') };
+    };
+    const runReview = (h, extraEnv = {}) => {
+      try {
+        const r = spawnSync('node', [path.join(h.tmp, '.agent/pipeline.mjs'), 'review', '--pr', '1', '--issue', '1'], {
+          cwd: h.tmp, encoding: 'utf8', stdio: 'pipe',
+          env: {
+            ...process.env,
+            PATH: h.bin + path.delimiter + (process.env.PATH || ''),
+            PI_BIN: path.join(h.bin, 'pi'),
+            FAKE_GH_LOG: h.ghLog,
+            FAKE_PI_LOG: h.piLog,
+            FAKE_PI_ERR: RESET_ERR,
+            MODEL_HEALTH_FILE: h.healthFile,
+            REVIEW_PROVIDER: 'zai-coding-cn',
+            REVIEW_MODEL: 'glm-5.3-flash',
+            REVIEW_FALLBACK_PROVIDER: 'deepseek',
+            REVIEW_FALLBACK_MODEL: 'deepseek-v4-flash',
+            ...extraEnv,
+          },
+        });
+        return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
+      } catch (e) { return { code: 1, out: '', err: String(e.message) }; }
+    };
+    const ghCalls = (h) => readFileSync(h.ghLog, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+    const piCalls = (h) => readFileSync(h.piLog, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+    const prComments = (h) => ghCalls(h).filter(a => a[0] === 'pr' && a[1] === 'comment');
+    const feedbacks = (h) => ghCalls(h).filter(a => a[0] === 'issue' && a[1] === 'create');
+    const primaryCalls = (h) => piCalls(h).filter(c => String(c.model).includes('glm')).length;
+    const readHealth = (h) => { try { return JSON.parse(readFileSync(h.healthFile, 'utf8')); } catch { return null; } };
+
+    const tidies = [];
+    try {
+      const h = mkHarness(); tidies.push(h.tmp);
+      const nowMs = Date.now();
+      // ── 第 1 轮：主模型 429 → 写健康条目 + 1 条 PR 警告 + 1 条上游反馈
+      const r1 = runReview(h);
+      const p1 = [];
+      if (r1.code !== 0) p1.push(`第 1 轮 exit ${r1.code}: ${r1.err.split('\n').slice(-2).join(' ')}`);
+      const hc1 = readHealth(h);
+      const entry = hc1?.['zai-coding-cn/glm-5.3-flash'];
+      if (!entry) p1.push('健康文件未写入主模型条目');
+      else {
+        const t = Date.parse(entry.until);
+        if (!Number.isFinite(t) || t < nowMs + 5 * 60_000 || t > nowMs + 7 * 864e5) p1.push(`until 不在钳制区间: ${entry.until}`);
+        if (entry.kind !== 'reset-at') p1.push(`kind 期望 reset-at 实得 ${entry.kind}`);
+        if (!entry.reason || entry.reason.length > 200) p1.push(`reason 缺失或超 200 字: ${String(entry.reason).length}`);
+        if (!entry.observedAt) p1.push('缺少 observedAt');
+      }
+      if (prComments(h).length !== 1) p1.push(`PR 警告评论期望 1 条实得 ${prComments(h).length}`);
+      if (!/审查模型不可用/.test(prComments(h)[0]?.join(' ') || '')) p1.push('PR 警告评论文案不含「审查模型不可用」');
+      if (feedbacks(h).length !== 1) p1.push(`上游 feedback 期望 1 条实得 ${feedbacks(h).length}`);
+      if (!/^\[skill-feedback\]/.test(String(feedbacks(h)[0]?.[feedbacks(h)[0].indexOf('--title') + 1] || ''))) p1.push('上游 feedback 标题缺 [skill-feedback] 前缀');
+      if (!/VERDICT: APPROVE/.test(r1.out)) p1.push(`第 1 轮未按回退模型的结果输出 VERDICT: APPROVE: ${r1.out.split('\n').slice(-2).join(' ')}`);
+      p1.length ? fail(`模型健康记忆端到端·第 1 轮 (17c): ${p1.join('; ')}`)
+        : ok('模型健康记忆端到端·第 1 轮 (17c): 429 → 健康文件写入 until（钳制区间内）/ PR 仅 1 条警告 / 上游仅 1 条反馈');
+
+      // ── 第 2 轮：主模型**零调用**，无第 2 条警告、无第 2 条反馈
+      const r2 = runReview(h);
+      const p2 = [];
+      if (r2.code !== 0) p2.push(`第 2 轮 exit ${r2.code}: ${r2.err.split('\n').slice(-2).join(' ')}`);
+      if (primaryCalls(h) !== 1) p2.push(`主模型总调用次数期望 1（第 1 轮那次）实得 ${primaryCalls(h)}`);
+      if (piCalls(h).filter(c => String(c.model).includes('deepseek')).length !== 2) p2.push(`回退模型调用期望 2 次实得 ${piCalls(h).filter(c => String(c.model).includes('deepseek')).length}`);
+      if (prComments(h).length !== 1) p2.push(`第 2 轮不应再发 PR 警告（期望 1 条实得 ${prComments(h).length}）`);
+      if (feedbacks(h).length !== 1) p2.push(`第 2 轮不应再上报上游（期望 1 条实得 ${feedbacks(h).length}）`);
+      const logText = existsSync(path.join(h.tmp, '.agent/logs/issue-1.md')) ? readFileSync(path.join(h.tmp, '.agent/logs/issue-1.md'), 'utf8') : '';
+      if (!/主模型冷却中/.test(logText)) p2.push('日志缺少「主模型冷却中（至 …）」记录（跳过不可见）');
+      if (!/model=deepseek\/deepseek-v4-flash/.test(logText)) p2.push('日志未如实记录本轮实际使用的回退模型');
+      if (/model=zai-coding-cn\/glm-5\.3-flash(?!.*回退)/.test(logText.split('主模型冷却中')[1] || '')) p2.push('冷却轮的 verdict 行把回退记成了主模型');
+      p2.length ? fail(`模型健康记忆端到端·第 2 轮 (17c): ${p2.join('; ')}`)
+        : ok('模型健康记忆端到端·第 2 轮 (17c): 主模型 0 次调用（累计仅 1）/ 无第 2 条警告 / 无第 2 条反馈 / 日志显示“主模型冷却中”且记账为回退模型');
+
+      // ── 第 3 轮：冷却到期 + 主模型恢复 → 健康条目被删除
+      writeFileSync(h.healthFile, JSON.stringify({ 'zai-coding-cn/glm-5.3-flash': { until: new Date(Date.now() - 60_000).toISOString(), kind: 'reset-at', reason: 'x', observedAt: new Date().toISOString() } }, null, 2));
+      runReview(h, { FAKE_PI_MODE: 'ok' });
+      const p3 = [];
+      if (primaryCalls(h) !== 2) p3.push(`冷却到期后应再调用主模型（累计期望 2 实得 ${primaryCalls(h)}）`);
+      const hc3 = readHealth(h);
+      if (hc3 && hc3['zai-coding-cn/glm-5.3-flash']) p3.push('主模型成功后健康条目未被删除');
+      p3.length ? fail(`模型健康记忆端到端·恢复 (17c): ${p3.join('; ')}`)
+        : ok('模型健康记忆端到端·恢复 (17c): 冷却到期后主模型被重试，成功后健康条目自动删除');
+
+      // ── 上游去重：24h 内已有同标题 feedback → 只写本地日志，不发新 issue
+      const h2 = mkHarness(); tidies.push(h2.tmp);
+      const existing = JSON.stringify([{ number: 23, title: '[skill-feedback] 审查模型不可用（zai-coding-cn/glm-5.3-flash）' }]);
+      const r4 = runReview(h2, { FAKE_GH_UPSTREAM: existing });
+      const p4 = [];
+      if (r4.code !== 0) p4.push(`第 4 轮 exit ${r4.code}: ${r4.err.split('\n').slice(-2).join(' ')}`);
+      if (feedbacks(h2).length !== 0) p4.push(`同标题已存在时不应再发 upstream issue（实发 ${feedbacks(h2).length} 条）`);
+      if (prComments(h2).length !== 1) p4.push(`PR 警告仍应照常发（期望 1 条实得 ${prComments(h2).length}）`);
+      if (!/已有同标题/.test(r4.err)) p4.push('去重时未在日志/终端留痕');
+      p4.length ? fail(`上游反馈去重 (17c): ${p4.join('; ')}`)
+        : ok('上游反馈去重 (17c): 24h 内已有同标题 [skill-feedback] → 不再新建 issue（PR 警告不受影响）');
+    } catch (e) {
+      fail(`模型健康回忆端到端 (17c): ${e.message}`);
+    } finally {
+      for (const t of tidies) rmSync(t, { recursive: true, force: true });
+    }
+  }
+
+  // 17d. `.agent/model-health.json` 必须在三处忽略清单里（否则 git add -A 会把它扫进 PR — lessons #9）
+  {
+    const where = [['.gitignore', readFileSync(path.join(ROOT, '.gitignore'), 'utf8')],
+      ['templates/gitignore.snippet', readFileSync(path.join(ROOT, 'templates/gitignore.snippet'), 'utf8')],
+      ['scripts/doctor.mjs 必需规则', readFileSync(path.join(ROOT, 'scripts/doctor.mjs'), 'utf8')]];
+    const miss = where.filter(([, txt]) => !txt.includes('.agent/model-health.json')).map(([n]) => n);
+    miss.length ? fail(`运行时文件忽略规则 (17d): ${miss.join(' / ')} 缺少 .agent/model-health.json`)
+      : ok('运行时文件忽略规则 (17d): .gitignore / templates/gitignore.snippet / doctor 必需规则 均含 .agent/model-health.json');
+  }
+
+  // 17e. 离线端到端·**审查循环路径**（Agent B review #1）：17c 只跑单独的 `review` 子命令，
+  //      每个进程只跑一轮，永远不进入 processIssueInner 的循环 → 掩盖了「循环里先 load、
+  //      runReviewRound 写 modelWarned、随后 save(旧对象) 整文件覆盖」的 bug。
+  //      这里用假 pi / 假 gh / 假 git 跑**真实** `run --issue`，同一进程连走 2 个审查轮，
+  //      断言：警告评论只有 1 条、主模型只调 1 次、modelWarned 活到最后一轮、记账为回退模型。
+  {
+    const tmp = mkdtempSync(path.join(os.tmpdir(), 'agent-loop-'));
+    try {
+      mkdirSync(path.join(tmp, '.agent/prompts'), { recursive: true });
+      copyFileSync(path.join(ROOT, 'templates/pipeline.mjs'), path.join(tmp, '.agent/pipeline.mjs'));
+      copyFileSync(path.join(ROOT, 'templates/lib.mjs'), path.join(tmp, '.agent/lib.mjs'));
+      copyFileSync(path.join(ROOT, 'templates/prompts/reviewer.md'), path.join(tmp, '.agent/prompts/reviewer.md'));
+      copyFileSync(path.join(ROOT, 'templates/prompts/implementer.md'), path.join(tmp, '.agent/prompts/implementer.md'));
+      writeFileSync(path.join(tmp, '.agent/state.json'), '{}');
+      writeFileSync(path.join(tmp, '.agent/config.json'), JSON.stringify({ upstream: 'acme/agent-dev-team', feedbackOptIn: true }, null, 2));
+      const bin = path.join(tmp, 'bin');
+      mkdirSync(bin, { recursive: true });
+      const ghLog = path.join(tmp, 'gh-calls.log');
+      const piLog = path.join(tmp, 'pi-calls.log');
+      writeFileSync(ghLog, ''); writeFileSync(piLog, '');
+      // 健康文件**故意写不进去**（指向一个目录：rename 会 EISDIR，读会 EISDIR）：
+      // 这样才能让第 2 轮再次真的调用主模型（否则冷却会掩盖 modelWarned 被覆盖的 bug），
+      // 「每条 PR 每天只警告一次」就完全由 modelWarned 承担 —— 正是 Agent B 抓到的路径。
+      const healthFile = path.join(tmp, 'blocked');
+      mkdirSync(healthFile, { recursive: true });
+
+      writeFileSync(path.join(bin, 'gh'), [
+        '#!/usr/bin/env node',
+        'const a = process.argv.slice(2);',
+        "const fs = require('node:fs');",
+        "const rec = () => fs.appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify(a) + '\\n');",
+        "const out = (s) => { process.stdout.write(s); process.exit(0); };",
+        "if (a[0] === 'issue' && a[1] === 'view') {",
+        "  const j = a[a.indexOf('--json') + 1] || '';",
+        "  if (j === 'labels') out(process.env.FAKE_GH_LABELS || '{\"labels\":[]}');",
+        "  out(JSON.stringify({ number: 1, title: 't', body: '', labels: [] }));",
+        '}',
+        "if (a[0] === 'issue' && a[1] === 'list') out(process.env.FAKE_GH_UPSTREAM || '[]');",
+        "if (a[0] === 'issue' && a[1] === 'create') { rec(); process.exit(0); }",
+        "if (a[0] === 'issue' && a[1] === 'comment') { rec(); process.exit(0); }",
+        "if (a[0] === 'pr' && a[1] === 'list') out(JSON.stringify([{ number: 1, headRefName: 'agent/1', title: 't' }]));",
+        "if (a[0] === 'pr' && ['comment', 'review', 'merge'].includes(a[1])) { rec(); process.exit(0); }",
+        "if (a[0] === 'pr' && a[1] === 'view') out(JSON.stringify({ state: 'MERGED', mergedAt: '2026-10-19T00:00:00Z', headRefName: 'agent/1' }));",
+        'process.exit(1);',
+        '',
+      ].join('\n'));
+      chmodSync(path.join(bin, 'gh'), 0o755);
+
+      // 假 git：一切成功；`ls-remote` 输出空（跳过残留分支清理）；`rev-parse --abbrev-ref` → master
+      writeFileSync(path.join(bin, 'git'), [
+        '#!/usr/bin/env node',
+        'const a = process.argv.slice(2);',
+        "if (a[0] === 'symbolic-ref') { process.stdout.write('master\\n'); process.exit(0); }",
+        "if (a[0] === 'rev-parse' && a.includes('--abbrev-ref')) { process.stdout.write('master\\n'); process.exit(0); }",
+        "if (a[0] === 'rev-parse') { process.stdout.write('0123456789abcdef0123456789abcdef01234567\\n'); process.exit(0); }",
+        'process.exit(0);',
+        '',
+      ].join('\n'));
+      chmodSync(path.join(bin, 'git'), 0o755);
+
+      // 假 pi：主模型（glm）在每轮都失败（真 429 原文）；回退模型第 1 次要求修改、第 2 次批准
+      writeFileSync(path.join(bin, 'pi'), [
+        '#!/usr/bin/env node',
+        "const fs = require('node:fs');",
+        'const a = process.argv.slice(2);',
+        "const sid = a[a.indexOf('--session-id') + 1] || '';",
+        "const model = a[a.indexOf('--model') + 1] || '(default)';",
+        "const log = process.env.FAKE_PI_LOG;",
+        "const prev = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\\n').filter(Boolean) : [];",
+        "fs.appendFileSync(log, JSON.stringify({ sid, model }) + '\\n');",
+        "if (!String(sid).includes('review')) { process.stdout.write('implemented\\n'); process.exit(0); }",
+        "if (String(model).includes('glm')) { process.stderr.write(process.env.FAKE_PI_ERR + '\\n'); process.exit(1); }",
+        'const fallbackReviews = prev.filter((l) => {',
+        '  try { const o = JSON.parse(l); return String(o.sid).includes("review") && !String(o.model).includes("glm"); } catch { return false; }',
+        '}).length;',
+        "process.stdout.write(fallbackReviews === 0 ? 'RESULT: REQUEST_CHANGES\\n' : 'RESULT: APPROVE\\n');",
+        'process.exit(0);',
+        '',
+      ].join('\n'));
+      chmodSync(path.join(bin, 'pi'), 0o755);
+
+      const r = spawnSync('node', [path.join(tmp, '.agent/pipeline.mjs'), 'run', '--issue', '1'], {
+        cwd: tmp, encoding: 'utf8', stdio: 'pipe',
+        env: {
+          ...process.env,
+          PATH: bin + path.delimiter + (process.env.PATH || ''),
+          PI_BIN: path.join(bin, 'pi'),
+          FAKE_GH_LOG: ghLog,
+          FAKE_PI_LOG: piLog,
+          FAKE_PI_ERR: '429: ' + RESET_ERR,
+          MODEL_HEALTH_FILE: healthFile,
+          TEST_SKIP: '1',
+          MAX_REVIEW_ROUNDS: '3',
+          REVIEW_PROVIDER: 'zai-coding-cn',
+          REVIEW_MODEL: 'glm-5.3-flash',
+          REVIEW_FALLBACK_PROVIDER: 'deepseek',
+          REVIEW_FALLBACK_MODEL: 'deepseek-v4-flash',
+        },
+      });
+
+      const problems = [];
+      const allOut = `${r.stdout || ''}\n${r.stderr || ''}`;
+      if ((r.status ?? 1) !== 0) problems.push(`run --issue exit ${r.status}: ${allOut.split('\n').slice(-3).join(' ')}`);
+      const calls = readFileSync(ghLog, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+      const prComments = calls.filter(a => a[0] === 'pr' && a[1] === 'comment');
+      const warningComments = prComments.filter(a => /审查模型不可用/.test(a.join(' ')));
+      if (warningComments.length !== 1) problems.push(`两轮审查后 PR 警告评论期望 1 条，实得 ${warningComments.length}（循环里的 state.save 覆盖了 modelWarned → 每轮重复警告）`);
+      const piCalls = readFileSync(piLog, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+      const reviewCalls = piCalls.filter(c => String(c.sid).includes('review'));
+      const primaryCalls = reviewCalls.filter(c => String(c.model).includes('glm')).length;
+      const fallbackCalls = reviewCalls.filter(c => String(c.model).includes('deepseek')).length;
+      if (primaryCalls !== 2) problems.push(`健康文件不可用时两轮都应调用主模型（期望 2 次）实得 ${primaryCalls}`);
+      if (fallbackCalls !== 2) problems.push(`回退模型审查调用期望 2 次实得 ${fallbackCalls}`);
+      let st = {};
+      try { st = JSON.parse(readFileSync(path.join(tmp, '.agent/state.json'), 'utf8')); } catch { problems.push('state.json 不可解析'); }
+      const entry = st['1'] || {};
+      if (entry.status !== 'merged') problems.push(`state#1.status 期望 merged 实得 ${entry.status}`);
+      if (entry.reviewedBy !== 'deepseek/deepseek-v4-flash') problems.push(`reviewedBy 期望回退模型实得 ${JSON.stringify(entry.reviewedBy)}`);
+      if (entry.reviewedViaFallback !== true) problems.push('reviewedViaFallback 未标为 true（回退未被标注）');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(entry.modelWarned?.['zai-coding-cn/glm-5.3-flash'] || ''))) problems.push(`state#1.modelWarned 丢失（循环里的 state.save 覆盖了它）: ${JSON.stringify(entry.modelWarned)}`);
+      const mergedComment = calls.filter(a => a[0] === 'issue' && a[1] === 'comment').map(a => a.join(' ')).find(t => /已合并/.test(t)) || '';
+      if (!/审查模型：deepseek\/deepseek-v4-flash（回退）/.test(mergedComment)) problems.push(`合并评论未写明审查模型（含“（回退）”标注）: ${mergedComment.slice(0, 200)}`);
+      problems.length ? fail(`模型健康记忆·审查循环端到端 (17e): ${problems.join('; ')}`)
+        : ok('模型健康记忆·审查循环端到端 (17e): 同一进程两轮均调用主模型（健康文件不可写）→ PR 警告仍只有 1 条、modelWarned 存活、reviewedBy/合并评论标注为回退模型');
+    } catch (e) {
+      fail(`模型健康记忆·审查循环端到端 (17e): ${e.message}`);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+}
+
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);

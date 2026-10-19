@@ -241,7 +241,7 @@ const CHECKS = [
       const p = path.join(ROOT, '.gitignore');
       if (!existsSync(p)) return { status: 'fail', detail: '.gitignore 不存在', fix: '创建 .gitignore 并写入 templates/gitignore.snippet 的规则' };
       const txt = readFileSync(p, 'utf8');
-      const required = ['.agent/state.json', '.agent/logs/', '.agent/tmp/', '.agent/**/*.log'];
+      const required = ['.agent/state.json', '.agent/model-health.json', '.agent/logs/', '.agent/tmp/', '.agent/**/*.log'];
       const missing = required.filter(r => !txt.includes(r));
       if (missing.length) return { status: 'fail', detail: `缺少忽略规则: ${missing.join(', ')}`, fix: '把 templates/gitignore.snippet 里的运行时规则写全（lessons #9）' };
       return { status: 'pass', detail: '包含全部必需运行时忽略规则' };

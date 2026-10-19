@@ -1,5 +1,6 @@
 # ── agent-dev-team runtime (never commit these) ──
 .agent/state.json
+.agent/model-health.json
 .agent/logs/
 .agent/tmp/
 .agent/**/*.log
