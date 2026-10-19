@@ -806,3 +806,75 @@ function cerr(...args) { process.stderr.write(args.map(scrub).join(' ') + '\n');
 - **断言要拿到真正的那条流**：`execFileSync` 成功路径看不到 stderr、`console.warn` 走的是
   stderr —— 测试工具选错会让"我加了断言"变成"我加了永不失败的断言"。写完断言**必须做
   一次负向验证**（去掉修复 → 断言变红），否则不知道它到底在测什么。
+
+---
+
+## 29. 模型不可用是**有截止时间的事实**：不记住 = 每轮重复付代价 + 重复上报 + 记账不实
+
+**现象**（2026-10-18，本仓库自身流水线）：主审查模型 `zai-coding-cn/glm-5.3-flash` 返回
+
+```
+429: {"code":"1310","message":"您已达到每周/每月使用上限，您的限额将在 2026-10-19 07:47:19 重置。"}
+```
+
+回退机制（lessons #15）生效了，`deepseek/deepseek-v4-flash` 完成审查、PR #22 正常合并。
+但这一次周期性中断（周/月额度）留下了三处**本可避免**的代价：
+
+1. **每个审查轮都重试一次已死的模型**：PR #22 跑了 3 个审查轮 → PR 上留下 **3 条**一模一样的
+   `⚠️ 审查模型不可用（zai-coding-cn/glm-5.3-flash）…` 评论
+   （<https://github.com/v3c70r/agent-dev-team/pull/22> 的评论区可见）。
+   错误文本已经把「什么时候恢复」（`限额将在 … 重置`）告诉我们，代码却直接丢弃。
+2. **重复上报**：同一天向上游发出两条**标题完全相同**的 skill-feedback ——
+   #23（2026-10-18T17:12:36Z）与 #24（2026-10-18T17:21:00Z）
+   （<https://github.com/v3c70r/agent-dev-team/issues/23> ·
+   <https://github.com/v3c70r/agent-dev-team/issues/24>）。`reportGap()` 只有「每日 ≤3 条」
+   的总量上限，**不按主题去重**。
+3. **记账不实**：回退轮结束后仍写 `log(… model=${describeModel(REVIEW)})` ——
+   日志把 fallback 审的那一轮记成主模型；`runReviewRound()` 也不返回「实际用了哪个模型」，
+   于是 `state.json` 与合并评论都看不出这次 approve 到底是谁给的。
+   —— 这直接削弱本产品的卖点「独立模型审查」：**不可追溯的承诺等于没有承诺**。
+
+**根因**：把「模型暂时不可用」当成**一次性故障**（异常 → 回退 → 继续），而额度是**周期性**的。
+`isModelUnavailable()` 只判「是不是不可用」，不解析「到什么时候」；全仓没有任何 health/cooldown
+状态，所以下一个审查轮、下一个 issue、下一小时都要重新付一次同样的代价。
+
+**外部证据（成熟模式是「失败 → 冷却 + 跳过」，不是每次请求都重试）**：
+
+- LiteLLM Router 的可靠性三件套 = cooldowns + fallbacks + retries：`allowed_fails` → `cooldown_time`，
+  冷却中的 deployment 被**跳过**，请求落到其余健康候选。<https://docs.litellm.ai/docs/routing>
+- HTTP 语义：429 的 `Retry-After` 就是「服务器告诉你什么时候再来」，忽略它按自己节奏重试是反模式。
+  <https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/429>
+- 回退链本身是标准件（LangChain `with_fallbacks`）—— 我们的真缺口不是「没有回退」，
+  而是**没有记忆**。<https://python.langchain.com/docs/how_to/fallbacks/>
+
+**修复**（纯确定性，无 LLM）：
+
+1. `lib.parseModelResetAt(text, now)` → `{ until, kind }`：识别
+   `限额将在 2026-10-19 07:47:19 重置` / `reset at …Z`（**按 UTC 解释**，报错不带时区）、
+   `Retry-After: N`、`try again in N minutes`、`X-RateLimit-Reset: <epoch>`；
+   一律**钳制到 `[now+5min, now+7d]`**，过去时间 → `now+5min`，都匹配不到 → `kind:'default'`
+   + `now + MODEL_COOLDOWN_MIN`（默认 30 分钟）。纯函数，不修改入参。
+2. `lib.shouldUsePrimary(health, { now, hasFallback })`：冷却中 → `false`（跳过主模型）；
+   无条目 / `until` 非法或已过 → `true`。**安全边界：`hasFallback === false` 恒 `true`**
+   —— 跳过主模型就等于没有模型可用。
+3. `pipeline` 把健康条目落到 `.agent/model-health.json`（原子写：`.tmp` 后 rename；可被
+   `MODEL_HEALTH_FILE` 覆盖以便测试；解析失败按空对象处理 = fail-open 到「用主模型」）。
+   `runReviewRound()` **先查健康**再调模型：冷却中直接回退并记一行
+   `B: 主模型冷却中（至 <until>，kind=<kind>），本轮直接用回退 <model>`；主模型成功 → **删除条目**。
+4. **一次中断只上报一次**：PR 警告按 `state.json` 的 `modelWarned: { "<model>": "<date>" }`
+   每条 PR 每天只发一次；`reportGap()` 发之前先查上游 24h 内是否已有**同标题** `[skill-feedback]`，
+   有则只写本地日志。
+5. **如实记账**：`runReviewRound()` 返回 `{ verdict, out, source, model }`；日志 `model=` 取实际值，
+   approve 时写 `state[issue].reviewedBy`(+`reviewedViaFallback`)，合并评论里写明
+   `审查模型：<model>`，回退时标注「（回退）」。
+6. `.agent/model-health.json` 加进 `.gitignore` / `templates/gitignore.snippet` /
+   `doctor` 的必需忽略规则（三处都加，否则 `git add -A` 会把它扫进 PR —— lessons #9）。
+
+**教训**：
+
+- **「暂时不可用」里的「暂时」是有截止时间的**：错误文本经常带着恢复时间，**解析它**比再试一次便宜得多。
+- **去重必须按主题**：只有「每日 N 条」的总量上限，仍然会让同一次中断在几小时内刷出多条同标题噪声。
+- **降级路径也要记账**：日志/state 里记的是「配置的主模型」而不是「实际用的模型」时，
+  审计链是断的 —— 而这恰恰是独立审查这个卖点的唯一证据。
+- **跳过主模型的前提是存在回退模型**：没有回退时的「健康跳过」会把系统变成没有模型可用，
+  所以这条判定要写成纯函数并单独测真值表（含 `hasFallback:false → true`）。

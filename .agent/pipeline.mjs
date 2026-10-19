@@ -28,18 +28,26 @@
 //                                    empty string = skip that step; non-npm
 //                                    repos MUST set them, e.g. `make build`,
 //                                    `pytest -q`)
+//    MODEL_COOLDOWN_MIN (default 30) how long to skip a review model whose
+//                                   error text carries NO parseable reset time
+//    MODEL_HEALTH_FILE              where the cooldown memory lives
+//                                   (default .agent/model-health.json, gitignored)
 // ══════════════════════════════════════════════════════════════════
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync, existsSync, copyFileSync, symlinkSync, rmSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, copyFileSync, symlinkSync, rmSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 // 出站凭据防线（SECRET_PATTERNS / assertNoSecrets / redactSecrets / countSecretMatches）
 // 现在只有一份实现，住在 lib.mjs（pipeline 与 pm/screen.mjs 共用）。见 docs/lessons.md #28。
-import { assertNoSecrets, classifyMergeAttempt, countSecretMatches, detectBase, formatRetryList, isRejectedIssue, MERGE_BLOCKED, MERGE_MERGED, mergeIssueState, prepareImplementerBranch, redactSecrets, REJECTED_LABEL, resolvePi, resolveTesterCommands, retryReset, SECRET_PATTERNS, selectPendingIssues, sh } from './lib.mjs';
+import { assertNoSecrets, classifyMergeAttempt, countSecretMatches, detectBase, formatRetryList, isRejectedIssue, makeModelHealthEntry, MERGE_BLOCKED, MERGE_MERGED, mergeIssueState, parseModelResetAt, prepareImplementerBranch, redactSecrets, REJECTED_LABEL, resolvePi, resolveTesterCommands, retryReset, SECRET_PATTERNS, selectPendingIssues, sh, shouldUsePrimary } from './lib.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const AGENT = path.join(ROOT, '.agent');
 const STATE_FILE = path.join(AGENT, 'state.json');
+// 模型健康状态（issue #25）：一次性周期性额度中断会横跨当天全部 issue、全部审查轮，
+// 所以「记住到重置时间」必须落在**文件**里，而不是某个进程的内存里。
+// 清单见 .gitignore（`git add -A` 不得把它扫进 PR —— lessons #9）。
+const MODEL_HEALTH_FILE = process.env.MODEL_HEALTH_FILE || path.join(AGENT, 'model-health.json');
 const LOG_DIR = path.join(AGENT, 'logs');
 const TMP = path.join(AGENT, 'tmp');
 const LABEL_APPROVED = 'agent-approved';
@@ -92,6 +100,26 @@ function openDependencies(issue) {
 function loadConfig() {
   try { return JSON.parse(readFileSync(path.join(AGENT, 'config.json'), 'utf8')); } catch { return {}; }
 }
+
+// ── 模型健康状态（issue #25）──────────────────────────────────────────
+// `{ "<provider>/<model>": { until, kind, reason, observedAt } }`
+// 读失败/解析失败 → 空对象（fail-open 到「用主模型」）：健康状态是**优化**，不是门禁，
+// 它坏了不能把流水线弄崩。写用「`.tmp` 后 rename」原子替换，避免半截 JSON 让下一轮
+// 把所有模型都当可用（或都当不可用）。
+function loadModelHealth() {
+  try {
+    const o = JSON.parse(readFileSync(MODEL_HEALTH_FILE, 'utf8'));
+    return o && typeof o === 'object' && !Array.isArray(o) ? o : {};
+  } catch { return {}; }
+}
+function saveModelHealth(health) {
+  try {
+    mkdirSync(path.dirname(MODEL_HEALTH_FILE), { recursive: true });
+    const tmp = `${MODEL_HEALTH_FILE}.tmp`;
+    writeFileSync(tmp, JSON.stringify(health || {}, null, 2));
+    renameSync(tmp, MODEL_HEALTH_FILE);   // 原子：读者要么看到旧文件，要么看到新文件
+  } catch (e) { cwarn('[health] 保存模型健康状态失败（不影响本轮）:', e.message); }
+}
 // 上游 feedback 通道（issue #21）：这是**跨仓库**出站点（发到第三方 cfg.upstream），
 // 一旦带上凭据就是公开泄漏且无法收回（只能吊销）。所以这里是**脱敏后发送**，
 // 不是硬拦截 —— feedback 是自我改进的输入，丢掉它就丢掉发现问题的能力。
@@ -103,12 +131,20 @@ function reportGap(title, body) {
     // anti-spam: at most 3 feedback issues per rolling day
     const since = new Date(Date.now() - 864e5).toISOString().slice(0, 10);
     const recent = ghJson(['issue', 'list', '-R', cfg.upstream, '--state', 'all',
-      '--search', `[skill-feedback] created:>=${since}`, '--limit', '10', '--json', 'number']);
+      '--search', `[skill-feedback] created:>=${since}`, '--limit', '10', '--json', 'number,title']);
     if (recent.length >= 3) { cwarn('[feedback] daily cap reached, skip'); return; }
+    const safeTitle = redactSecrets(title);
+    // 主题去重（issue #25）：同一次中断（周/月额度）会在几小时内反复触发 reportGap，
+    // 旧代码只有「每日 ≤ 3 条」的总量上限，于是同一天发了 #23/#24 两条**标题完全相同**的
+    // feedback —— 维护者被同一条噪声淹没。同一标题 24h 内已存在 → 只写本地日志。
+    const wanted = `[skill-feedback] ${safeTitle}`;
+    if (recent.some(it => String(it?.title || '').trim() === wanted)) {
+      cwarn(`[feedback] 24h 内已有同标题 feedback，跳过: ${wanted}`);
+      return;
+    }
     const hidden = countSecretMatches(title) + countSecretMatches(body);
     const redactNote = hidden ? `\n\n> 🔒 已自动脱敏 ${hidden} 处疑似凭据（不含完整令牌）。` : '';
     const full = `${redactSecrets(body)}${redactNote}\n\n---\n_自动反馈来自 agent-dev-team 流水线（opt-in）。不应包含用户代码；如包含请维护者删除。 ${new Date().toISOString()}_`;
-    const safeTitle = redactSecrets(title);
     try {
       gh(['issue', 'create', '-R', cfg.upstream, '--label', 'skill-feedback', '--title', `[skill-feedback] ${safeTitle}`, '--body', redactSecrets(full)]);
     } catch {
@@ -289,25 +325,81 @@ function isModelUnavailable(err) {
   return /\b429\b|insufficient|balance|quota|无可用资源|余额不足|欠费|rate.?limit|too many requests|capacity|overload/i.test(s);
 }
 
+// 主模型是否「冷却中」：只在**存在回退模型**时才允许跳过（否则跳过 = 没模型可用）。
+function reviewHasFallback() {
+  return Boolean((REVIEW_FALLBACK.provider || '') || (REVIEW_FALLBACK.model || ''));
+}
+
+// 每条 PR **每天只警告一次**（issue #25）：同一个周期性额度中断会跨当天全部审查轮，
+// 旧代码每轮都 commentOnPr → PR #22 上留下 3 条一模一样的 ⚠️。标记落在 state.json
+// 的 `modelWarned: { "<provider/model>": "<YYYY-MM-DD>" }`（同日同模型 → 不再发）。
+function shouldWarnModelOnce(issueNum, modelKey) {
+  const today = new Date().toISOString().slice(0, 10);
+  const s = state.load();
+  const prev = s[issueNum]?.modelWarned?.[modelKey];
+  if (prev === today) return false;
+  s[issueNum] = mergeIssueState(s[issueNum], {
+    modelWarned: { ...(s[issueNum]?.modelWarned || {}), [modelKey]: today },
+  });
+  state.save(s);
+  return true;
+}
+
 async function runReviewRound(issueNum, prNum) {
   const prompt = buildPrompt('reviewer', { issue: { number: issueNum }, pr: prNum });
+  const primaryKey = describeModel(REVIEW);
+  const fallbackModel = REVIEW_FALLBACK;
+  const fallbackKey = describeModel(fallbackModel);
+  const hasFallback = reviewHasFallback();
+  let health = loadModelHealth();
+  const entry = health[primaryKey];
   let out;
-  try {
-    out = runPi(`agent-review-${prNum}`, prompt, null, REVIEW, reviewerEnv());
-  } catch (err) {
-    if (!isModelUnavailable(err)) throw err;
-    const fallback = REVIEW_FALLBACK;
-    const detail = String((err.stderr || err.message || '')).slice(0, 300);
-    cwarn(`[review] ${describeModel(REVIEW)} unavailable → fallback ${describeModel(fallback)}: ${detail}`);
-    log(issueNum, `B: 模型不可用（${describeModel(REVIEW)}）→ 回退到 ${describeModel(fallback)}`);
-    try { commentOnPr(prNum, `⚠️ **审查模型不可用**（\`${describeModel(REVIEW)}\`）：\`${detail.replace(/\n/g, ' ')}\`\n\n已自动回退到 \`${describeModel(fallback)}\` 完成本轮审查（不影响合并）。\n长期方案：为账户充值，或设置 \`REVIEW_PROVIDER\`/\`REVIEW_MODEL\` 指向可用模型。`); } catch {}
-    reportGap(`审查模型不可用（${describeModel(REVIEW)}）`, `## 现象\n审查轮次调用模型失败，错误被判定为额度/限流类。\n\n## 模型\n- 主: ${describeModel(REVIEW)}\n- 回退: ${describeModel(fallback)}\n\n## 错误\n\`\`\`\n${detail}\n\`\`\`\n\n## 建议\n模板已自动回退；可考虑在 doctor 中预检模型额度（\`pi auth check\` 不检测余额），或支持多模型候选列表。`);
-    out = runPi(`agent-review-${prNum}`, prompt, null, fallback, reviewerEnv());
+  let model = primaryKey;
+  let viaFallback = false;
+
+  if (!shouldUsePrimary(entry, { hasFallback })) {
+    // 冷却中：**一次也不调用**主模型（真实事故里每轮都重试一次已死的模型）。
+    viaFallback = true;
+    model = fallbackKey;
+    log(issueNum, `B: 主模型冷却中（至 ${entry.until}，kind=${entry.kind || '?'}），本轮直接用回退 ${model}`);
+    out = runPi(`agent-review-${prNum}`, prompt, null, fallbackModel, reviewerEnv());
+  } else {
+    try {
+      out = runPi(`agent-review-${prNum}`, prompt, null, REVIEW, reviewerEnv());
+      // 主模型成功 → 删除健康条目（“恢复后自动删除”，不需要人工清文件）
+      if (health[primaryKey]) {
+        delete health[primaryKey];
+        saveModelHealth(health);
+        log(issueNum, `B: 主模型 ${primaryKey} 已恢复，清除健康记录`);
+      }
+    } catch (err) {
+      if (!isModelUnavailable(err)) throw err;
+      // 错误文本已经告诉我们「什么时候恢复」：记住它，别每轮重付一次代价。
+      const rawDetail = String(err.stderr || err.stdout || err.message || '');
+      const detail = rawDetail.slice(0, 300);
+      const reset = parseModelResetAt(rawDetail);
+      health = loadModelHealth();               // 重读，避免覆盖别的 issue 刚写的条目
+      health[primaryKey] = makeModelHealthEntry(reset, detail);
+      saveModelHealth(health);
+      cwarn(`[review] ${primaryKey} unavailable（until=${health[primaryKey].until}, kind=${health[primaryKey].kind}）→ fallback ${fallbackKey}: ${detail}`);
+      log(issueNum, `B: 模型不可用（${primaryKey}）→ 回退到 ${fallbackKey}；冷却至 ${health[primaryKey].until}（kind=${health[primaryKey].kind}）`);
+      if (shouldWarnModelOnce(issueNum, primaryKey)) {
+        try {
+          commentOnPr(prNum, `⚠️ **审查模型不可用**（\`${primaryKey}\`）：\`${detail.replace(/\n/g, ' ')}\`\n\n已自动回退到 \`${fallbackKey}\` 完成本轮审查（不影响合并）。\n\n预计恢复时间：\`${health[primaryKey].until}\`（此后本轮不再重试该模型，同一天只提醒一次）。\n长期方案：为账户充值，或设置 \`REVIEW_PROVIDER\`/\`REVIEW_MODEL\` 指向可用模型。`);
+        } catch {}
+      }
+      reportGap(`审查模型不可用（${primaryKey}）`, `## 现象\n审查轮次调用模型失败，错误被判定为额度/限流类。\n\n## 模型\n- 主: ${primaryKey}\n- 回退: ${fallbackKey}\n- 预计恢复: ${health[primaryKey].until}（解析方式 kind=${health[primaryKey].kind}）\n\n## 错误\n\`\`\`\n${detail}\n\`\`\`\n\n## 建议\n模板已自动回退，并在本轮之后的冷却窗口内跳过主模型；可考虑在 doctor 中预检模型额度（\`pi auth check\` 不检测余额），或支持多模型候选列表。`);
+      viaFallback = true;
+      model = fallbackKey;
+      out = runPi(`agent-review-${prNum}`, prompt, null, fallbackModel, reviewerEnv());
+    }
   }
   const { verdict, source } = parseReviewVerdict(out);
-  log(issueNum, `B: verdict=${verdict} (${source}, model=${describeModel(REVIEW)})`);
+  // 如实记账（issue #25）：这里必须写**实际使用**的模型 —— 旧代码无条件写主模型，
+  // 把回退轮记成主模型，state/合并评论都看不出到底谁审的。
+  log(issueNum, `B: verdict=${verdict} (${source}, model=${model}${viaFallback ? ' 回退' : ''})`);
   log(issueNum, `B: review 输出:\n${out.split('\n').slice(-30).join('\n')}`);
-  return { verdict, out, source };
+  return { verdict, out, source, model, fallback: viaFallback };
 }
 
 // ── Role C: tester (functional tests) ──
@@ -523,6 +615,10 @@ async function processIssueInner(issue, force = false) {
       const res = await runReviewRound(issue.number, pr.number);
       lastReviewOut = res.out;
       lastReviewVerdict = res.verdict;
+      // 如实记账（issue #25）：记下**实际**给这轮结论的模型（主 or 回退），
+      // 合并评论里会显式写出，这样“独立模型审查”到底谁审的可追溯。
+      fresh[issue.number].reviewedBy = res.model;
+      fresh[issue.number].reviewedViaFallback = Boolean(res.fallback);
       if (res.verdict === 'APPROVE') { fresh[issue.number].status = 'approved'; state.save(fresh); break; }
       const note = `Agent B 要求修改（第 ${r + 1} 轮），请根据 PR #${pr.number} 上 Agent B 的评论修改。`;
       fresh[issue.number].status = 'reviewing';
@@ -601,7 +697,11 @@ async function finishMerge(issueNum, prNum) {
   }
   // ── 批准：优先用独立 reviewer 账号提交**真实** approve review ──
   // （同一账号无法批准自己的 PR —— lessons #4；因此推荐配置第二个账号）
-  const approveBody = `🤖 Agent B 已批准 + Agent C 测试通过${reviewerGhUser() ? `（批准账号：${reviewerGhUser()}）` : ''}`;
+  // 审查模型可追溯（issue #25）：批准说明里带上实际使用了谁，回退时显式标注。
+  const stReview = state.load()[issueNum] || {};
+  const reviewedBy = stReview.reviewedBy ? String(stReview.reviewedBy) : '';
+  const reviewModelNote = reviewedBy ? `审查模型：${reviewedBy}${stReview.reviewedViaFallback ? '（回退）' : ''}` : '';
+  const approveBody = `🤖 Agent B 已批准 + Agent C 测试通过${reviewerGhUser() ? `（批准账号：${reviewerGhUser()}）` : ''}${reviewModelNote ? `（${reviewModelNote}）` : ''}`;
   let approvalNote = '';
   if (reviewerGhUser()) {
     try {
@@ -684,7 +784,7 @@ async function finishMerge(issueNum, prNum) {
     const errNote = mergeErr
       ? `\n\n> ⚠️ \`gh pr merge\` 退出码非零（\`${mergeErr.message}\`），但读回 PR 状态确认已合并 —— **以真实状态为准**。`
       : '';
-    commentOnIssue(issueNum, `🎉 已合并 (PR #${prNum})。issue 将被自动关闭。\n\n${approvalNote}${errNote}`);
+    commentOnIssue(issueNum, `🎉 已合并 (PR #${prNum})。issue 将被自动关闭。\n\n${approvalNote}${reviewModelNote ? `\n\n${reviewModelNote}` : ''}${errNote}`);
     log(issueNum, `状态: merged${mergeErr ? '（尽管 gh pr merge 报错，读回状态为已合并）' : ''}`);
     return { merged: true };
   }
@@ -831,8 +931,8 @@ async function main() {
     const ii = process.argv.indexOf('--issue');
     const issueNum = ii >= 0 ? process.argv[ii + 1] : 'unknown';
     console.log(`reviewing PR #${prNum} with ${describeModel(REVIEW)}`);
-    const { verdict, out } = await runReviewRound(issueNum, prNum);
-    console.log(`\nVERDICT: ${verdict}\n`);
+    const { verdict, out, model } = await runReviewRound(issueNum, prNum);
+    console.log(`\nVERDICT: ${verdict}（model=${model}）\n`);
     // 模型输出尾已过 `log()` 脱敏；这里直接打终端，所以同样要脱敏（同一类出站点）。
     console.log(redactSecrets(out.split('\n').slice(-20).join('\n')));
     return;

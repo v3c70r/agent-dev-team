@@ -113,6 +113,7 @@ gh issue create ... 不需要预建，但 label 必须存在
 **gitignore（必须在首次运行前加，否则运行时文件会被 Agent A 的 `git add -A` 扫进 PR）**：
 ```
 .agent/state.json
+.agent/model-health.json      # 审查模型的冷却记录（issue #25）
 .agent/logs/
 .agent/tmp/
 .agent/**/*.log
@@ -121,7 +122,7 @@ gh issue create ... 不需要预建，但 label 必须存在
 .agent/pm/context.md
 .agent/pm/wt/
 ```
-（完整片段见 `templates/gitignore.snippet`）
+（完整片段见 `templates/gitignore.snippet`；`npm run doctor` 会检查这几条是否写全 —— lessons #9）
 
 **提交并推送**这些文件（这会让 GitHub Actions triage 生效）。
 
@@ -218,6 +219,20 @@ pipeline 在开工前会检查这些前置 issue：**只要有未关闭的，就
 | 单独复审 | `node .agent/pipeline.mjs review --pr <N> --issue <M>` |
 | PM 状态/演练 | `node .agent/pm/run.mjs --check` / `--dry-run --force` |
 | 停止 | `tmux kill-session -t agent`（PM: `-t pm`） |
+
+### 审查模型冷却（模型不可用时的记忆，issue #25）
+
+审查模型遇到额度/限流（429）时，模板不只是"回退到 `reviewFallback`"，还会**记住到什么时候**：
+
+| 项 | 说明 |
+|---|---|
+| 冷却记录 | `.agent/model-health.json`（gitignored，原子写；`MODEL_HEALTH_FILE` 可覆盖路径）：`{ "<provider>/<model>": { until, kind, reason, observedAt } }` |
+| 解析来源 | 错误文本里的重置时间（`限额将在 … 重置` / `reset at …` / `Retry-After` / `X-RateLimit-Reset`），按 UTC 解释并钳制到 `[now+5min, now+7d]` |
+| 冷却中 | **不再调用主模型**，本轮直接用回退模型；日志记 `B: 主模型冷却中（至 …, kind=…）` |
+| 恢复 | 冷却到期后自动重试主模型，成功后**自动删除**该条目 |
+| 上报 | 每条 PR **每天只警告一次**；上游 `[skill-feedback]` 24h 内同标题不重复发 |
+| **提前清除冷却** | `rm .agent/model-health.json`（或删掉其中该模型的条目）—— 例如你已充值/换额度，不想等重置时间；也可以 `MODEL_COOLDOWN_MIN` 调小「解析不出重置时间」时的默认冷却（默认 30 分钟） |
+| 安全边界 | **没有配置 `reviewFallback*` 时永不跳过主模型**（跳过 = 没有模型可用） |
 
 ## 必须遵守的坑位规则（全部来自真实事故，见 docs/lessons.md）
 

@@ -279,6 +279,114 @@ export function redactSecrets(text) {
   return out;
 }
 
+// ── 模型不可用是「有截止时间的事实」（issue #25）───────────────────────
+// 真实事故（2026-10-18）：主审查模型返回
+//   `429: {"code":"1310","message":"您已达到每周/每月使用上限，您的限额将在 2026-10-19 07:47:19 重置。"}`
+// 回退机制生效了，但**没有记忆**：每个审查轮都重试一次已死的模型 → PR 上 3 条一模一样
+// 的警告、上游 2 条同标题 feedback（#23/#24）、日志把回退轮记成主模型。错误文本已经把
+// 「什么时候恢复」告诉了我们，代码却丢弃了。这里把它变成结构化事实：
+//   parseModelResetAt() → { until, kind }（纯函数，UTC 解释 + 钳制到 [now+5min, now+7d]）
+//   shouldUsePrimary()  → 冷却中的主模型是否该被跳过（纯函数）
+// 与成熟做法一致：LiteLLM Router 的 `allowed_fails → cooldown_time`（冷却中的 deployment
+// 被跳过），HTTP 429 的 `Retry-After` 就是「服务器告诉你什么时候再来」。
+// 安全边界：**只有存在回退模型时才允许跳过主模型**（否则跳过 = 没有模型可用）。
+export const MODEL_COOLDOWN_DEFAULT_MIN = 30;
+/** 冷却下限：解析出的时间过分乐观（或已过期）时至少等 5 分钟，避免疯狂重试。 */
+export const MODEL_COOLDOWN_MIN_MS = 5 * 60_000;
+/** 冷却上限：周/月额度重置很少超过一周，超过按 7 天算（防止解析出离谱的年份卡死）。 */
+export const MODEL_COOLDOWN_MAX_MS = 7 * 864e5;
+
+/** `MODEL_COOLDOWN_MIN`（分钟，默认 30）—— 只用于「解析不出重置时间」时的默认冷却。 */
+export function modelCooldownMinutes(env = process.env) {
+  const raw = Number(env?.MODEL_COOLDOWN_MIN);
+  if (!Number.isFinite(raw) || raw <= 0) return MODEL_COOLDOWN_DEFAULT_MIN;
+  return Math.min(raw, MODEL_COOLDOWN_MAX_MS / 60_000);
+}
+
+const toMs = (v) => (v instanceof Date ? v.getTime() : Number.isFinite(Number(v)) ? Number(v) : Date.now());
+
+// 报错里的时间戳**不带时区**时按 UTC 解释（服务端就是这么给的），带时区则尊重它。
+const ABS_TIME_RE = /(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|[+-]\d{2}:?\d{2})?/;
+function absoluteResetMs(text) {
+  const m = String(text || '').match(ABS_TIME_RE);
+  if (!m) return null;
+  const [, y, mo, d, hh, mi, ss, frac, tz] = m;
+  const fracPart = frac ? `.${frac.padEnd(3, '0')}` : '';
+  const zone = !tz ? 'Z' : tz === 'Z' ? 'Z' : tz.replace(/^([+-]\d{2})(\d{2})$/, '$1:$2');
+  const t = Date.parse(`${y}-${mo}-${d}T${hh}:${mi}:${ss}${fracPart}${zone}`);
+  return Number.isFinite(t) ? t : null;
+}
+
+const RELATIVE_UNIT_MS = {
+  s: 1000, sec: 1000, second: 1000, seconds: 1000, 秒: 1000,
+  m: 60_000, min: 60_000, mins: 60_000, minute: 60_000, minutes: 60_000, 分: 60_000, 分钟: 60_000,
+  h: 36e5, hr: 36e5, hrs: 36e5, hour: 36e5, hours: 36e5, 小时: 36e5,
+};
+
+/**
+ * Parse "when will this model be usable again" out of an error text.
+ * Returns `{ until: <ISO>, kind }` — never throws, never mutates its inputs.
+ * Recognised shapes (in priority order):
+ *   `X-RateLimit-Reset: 1760000000` (epoch s / ms), `限额将在 2026-10-19 07:47:19 重置`
+ *   / `reset at 2026-10-19T07:47:19Z` (absolute), `Retry-After: 120` (seconds),
+ *   `try again in 20 minutes` / `请在 20 分钟后重试` (relative).
+ * Anything else → `kind: 'default'`, `until = now + MODEL_COOLDOWN_MIN` (fail-closed:
+ * a model that we know is broken is NOT retried on every round).
+ */
+export function parseModelResetAt(text, now = new Date(), opts = {}) {
+  const s = String(text ?? '');
+  const nowMs = toMs(now);
+  const cooldownMin = opts.cooldownMin ?? modelCooldownMinutes();
+  const clamp = (ms) => Math.min(Math.max(ms, nowMs + MODEL_COOLDOWN_MIN_MS), nowMs + MODEL_COOLDOWN_MAX_MS);
+  const parsers = [
+    ['epoch-reset', () => {
+      const m = s.match(/x-ratelimit-reset\s*[:=]?\s*(\d{10,13})/i);
+      if (!m) return null;
+      const n = Number(m[1]);
+      return n < 1e12 ? n * 1000 : n;   // < 1e12 视为 epoch 秒，否则毫秒
+    }],
+    ['reset-at', () => absoluteResetMs(s)],
+    ['retry-after', () => {
+      const m = s.match(/\bretry[-\s]?after\b\s*[:=]?\s*(\d{1,6})/i);
+      return m ? nowMs + Number(m[1]) * 1000 : null;   // HTTP 语义：秒
+    }],
+    ['try-again', () => {
+      const m = s.match(/try again in\s*(\d{1,4})\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|秒|分钟|分|小时)/i)
+        || s.match(/(\d{1,4})\s*(秒|分钟|分|小时)\s*(?:后|之后)/);
+      if (!m) return null;
+      const unit = RELATIVE_UNIT_MS[String(m[2]).toLowerCase()];
+      return unit ? nowMs + Number(m[1]) * unit : null;
+    }],
+  ];
+  for (const [kind, fn] of parsers) {
+    let ms = null;
+    try { ms = fn(); } catch { ms = null; }
+    if (Number.isFinite(ms)) return { until: new Date(clamp(ms)).toISOString(), kind };
+  }
+  return { until: new Date(clamp(nowMs + cooldownMin * 60_000)).toISOString(), kind: 'default' };
+}
+
+/**
+ * Should this round be allowed to call the PRIMARY model?
+ *  * no health entry / missing or unparsable `until` / `until` already passed → true
+ *  * `hasFallback === false` → **always true**：跳过主模型就等于没有模型可用
+ *    （安全边界，见 issue #25「不改变安全边界」）。
+ * Pure: never mutates `health`.
+ */
+export function shouldUsePrimary(health, { now = new Date(), hasFallback = true } = {}) {
+  if (hasFallback === false) return true;
+  if (!health || typeof health !== 'object') return true;
+  const t = Date.parse(String(health.until ?? ''));
+  if (!Number.isFinite(t)) return true;
+  return t <= toMs(now);
+}
+
+/** health entry shape: `{ until: ISO, kind, reason: <error digest ≤200 chars>, observedAt: ISO }` */
+export function makeModelHealthEntry(reset, reason, now = new Date()) {
+  const digest = String(reason ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
+  return { until: String(reset?.until ?? ''), kind: String(reset?.kind ?? 'default'), reason: digest, observedAt: new Date(toMs(now)).toISOString() };
+}
+
 /**
  * Hard block (fail-closed): refuse to send text containing a token shape.
  * Used for bodies the pipeline itself writes — never "sanitize then send".

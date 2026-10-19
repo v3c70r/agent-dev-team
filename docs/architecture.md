@@ -85,6 +85,30 @@ pr_open  ─ retry → 拒绝（无需重试）
 （detached HEAD 下 `--delete-branch` 会「先合并、后报错」），合并前会 best-effort 切回 `BASE`；
 读不到状态则 fail-closed（`needs_human`）；合并成功后尽力清理残留的远程分支（lesson #24）。
 
+## 模型路由与冷却（issue #25）
+
+- 每个角色一个模型：A=`IMPL_*`（默认 pi 默认）、B=`REVIEW_*`（独立厂商）+ `REVIEW_FALLBACK_*`、
+  筛选=`SCREEN_*`；`describeModel()` 是唯一的人类可读命名口。
+- **模型不可用是「有截止时间的事实」**：额度/限流错误里的重置时间被 `lib.parseModelResetAt()`
+  解析成 `{ until, kind }`（UTC 解释 + 钳制 `[now+5min, now+7d]`；解析不出 → `now + MODEL_COOLDOWN_MIN`，
+  默认 30 分钟），落到 `.agent/model-health.json`（原子写、gitignored、`MODEL_HEALTH_FILE` 可覆盖）。
+- `runReviewRound()` **先查健康**（`lib.shouldUsePrimary()`）再调模型：冷却中**一次也不调**主模型，
+  直接走回退并记一行 `B: 主模型冷却中（至 <until>，kind=<kind>）…`；主模型成功即删除该条目。
+  **安全边界**：没有配置 `reviewFallback*` 时 `shouldUsePrimary()` 恒 `true` —— 跳过主模型
+  等于没有模型可用。
+- **一次中断只上报一次**：PR 警告按 `state.json` 的 `modelWarned: { "<model>": "<YYYY-MM-DD>" }`
+  每条 PR 每天一次；`reportGap()` 发送前先查上游 24h 内是否已有同标题 `[skill-feedback]`
+  （旧行为只有「每日 ≤3 条」总量上限，于是 #23/#24 是两条同标题噪声）。
+- **如实记账**：`runReviewRound()` 返回 `{ verdict, out, source, model, fallback }`，日志的 `model=`
+  取实际使用值；approve 时写 `state[issue].reviewedBy`（+`reviewedViaFallback`），
+  合并评论写明 `审查模型：<model>`，回退时标注「（回退）」—— 这是「独立模型审查」这个卖点
+  的唯一可追溯证据。
+- 保证是结构性的：`scripts/validate.mjs` 17a 用 #23 的**真实报错原文**断言解析结果与
+  `shouldUsePrimary` 真值表；17b 断言「健康检查先于主模型 `runPi(`」、成功后删条目、
+  `modelWarned`/`reviewedBy`/`reportGap` 去重确实存在；17c 用假 `pi`（计数）+ 假 `gh` +
+  临时 `MODEL_HEALTH_FILE` 跑**真实** pipeline：第 1 轮写条目/1 条警告/1 条反馈，
+  第 2 轮主模型 **0 次调用**、无重复评论与反馈，冷却到期后条目被自动删除。
+
 ## 出站正文与日志的凭据防线（issue #21）
 
 事故前提：GitHub push protection / secret scanning 会吊销**已推送**的令牌 —— 不能
