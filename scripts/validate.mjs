@@ -1207,6 +1207,13 @@ let doctorHumanOut = '';
     if (!/delete health\[primaryKey\]/.test(pipe)) miss.push('主模型成功后未删除健康条目');
     if (!/modelWarned/.test(pipe)) miss.push('缺少 modelWarned（每条 PR 每天只警告一次）');
     if (!/\.reviewedBy\s*=\s*res\.model/.test(pipe)) miss.push('approve 时未写 state[issue].reviewedBy = 实际模型');
+    // Agent B review #1（真实 bug）：审查循环必须在 runReviewRound **之后**重读 state，
+    // 否则随后的 state.save(旧对象)（整文件覆盖）会抹掉刚写的 modelWarned。
+    const loop = pipe.split('for (let r = 0; r < maxRounds; r++) {')[1]?.split('// 3) TEST')[0] || '';
+    const iRun = loop.indexOf('await runReviewRound(');
+    const iReload = loop.indexOf('fresh = state.load()');
+    if (iRun === -1) miss.push('审查循环未调用 runReviewRound（无法断言重读顺序）');
+    else if (iReload === -1 || iReload < iRun) miss.push('审查循环在 runReviewRound 之前 load state → 随后的 save 会覆盖刚写入的 modelWarned（同一条 PR 会每轮重复警告）');
     if (!/reviewedBy/.test(pipe.split('async function finishMerge(')[1]?.split('\n}')[0] || '')) miss.push('finishMerge 的批准说明未带上审查模型');
     if (/verdict=\$\{verdict\} \(\$\{source\}, model=\$\{describeModel\(REVIEW\)\}\)/.test(pipe)) miss.push('日志仍把回退轮记成主模型（model= 必须取实际模型）');
     // reportGap 去重必须在 issue create 之前
@@ -1373,6 +1380,137 @@ let doctorHumanOut = '';
     const miss = where.filter(([, txt]) => !txt.includes('.agent/model-health.json')).map(([n]) => n);
     miss.length ? fail(`运行时文件忽略规则 (17d): ${miss.join(' / ')} 缺少 .agent/model-health.json`)
       : ok('运行时文件忽略规则 (17d): .gitignore / templates/gitignore.snippet / doctor 必需规则 均含 .agent/model-health.json');
+  }
+
+  // 17e. 离线端到端·**审查循环路径**（Agent B review #1）：17c 只跑单独的 `review` 子命令，
+  //      每个进程只跑一轮，永远不进入 processIssueInner 的循环 → 掩盖了「循环里先 load、
+  //      runReviewRound 写 modelWarned、随后 save(旧对象) 整文件覆盖」的 bug。
+  //      这里用假 pi / 假 gh / 假 git 跑**真实** `run --issue`，同一进程连走 2 个审查轮，
+  //      断言：警告评论只有 1 条、主模型只调 1 次、modelWarned 活到最后一轮、记账为回退模型。
+  {
+    const tmp = mkdtempSync(path.join(os.tmpdir(), 'agent-loop-'));
+    try {
+      mkdirSync(path.join(tmp, '.agent/prompts'), { recursive: true });
+      copyFileSync(path.join(ROOT, 'templates/pipeline.mjs'), path.join(tmp, '.agent/pipeline.mjs'));
+      copyFileSync(path.join(ROOT, 'templates/lib.mjs'), path.join(tmp, '.agent/lib.mjs'));
+      copyFileSync(path.join(ROOT, 'templates/prompts/reviewer.md'), path.join(tmp, '.agent/prompts/reviewer.md'));
+      copyFileSync(path.join(ROOT, 'templates/prompts/implementer.md'), path.join(tmp, '.agent/prompts/implementer.md'));
+      writeFileSync(path.join(tmp, '.agent/state.json'), '{}');
+      writeFileSync(path.join(tmp, '.agent/config.json'), JSON.stringify({ upstream: 'acme/agent-dev-team', feedbackOptIn: true }, null, 2));
+      const bin = path.join(tmp, 'bin');
+      mkdirSync(bin, { recursive: true });
+      const ghLog = path.join(tmp, 'gh-calls.log');
+      const piLog = path.join(tmp, 'pi-calls.log');
+      writeFileSync(ghLog, ''); writeFileSync(piLog, '');
+      // 健康文件**故意写不进去**（指向一个目录：rename 会 EISDIR，读会 EISDIR）：
+      // 这样才能让第 2 轮再次真的调用主模型（否则冷却会掩盖 modelWarned 被覆盖的 bug），
+      // 「每条 PR 每天只警告一次」就完全由 modelWarned 承担 —— 正是 Agent B 抓到的路径。
+      const healthFile = path.join(tmp, 'blocked');
+      mkdirSync(healthFile, { recursive: true });
+
+      writeFileSync(path.join(bin, 'gh'), [
+        '#!/usr/bin/env node',
+        'const a = process.argv.slice(2);',
+        "const fs = require('node:fs');",
+        "const rec = () => fs.appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify(a) + '\\n');",
+        "const out = (s) => { process.stdout.write(s); process.exit(0); };",
+        "if (a[0] === 'issue' && a[1] === 'view') {",
+        "  const j = a[a.indexOf('--json') + 1] || '';",
+        "  if (j === 'labels') out(process.env.FAKE_GH_LABELS || '{\"labels\":[]}');",
+        "  out(JSON.stringify({ number: 1, title: 't', body: '', labels: [] }));",
+        '}',
+        "if (a[0] === 'issue' && a[1] === 'list') out(process.env.FAKE_GH_UPSTREAM || '[]');",
+        "if (a[0] === 'issue' && a[1] === 'create') { rec(); process.exit(0); }",
+        "if (a[0] === 'issue' && a[1] === 'comment') { rec(); process.exit(0); }",
+        "if (a[0] === 'pr' && a[1] === 'list') out(JSON.stringify([{ number: 1, headRefName: 'agent/1', title: 't' }]));",
+        "if (a[0] === 'pr' && ['comment', 'review', 'merge'].includes(a[1])) { rec(); process.exit(0); }",
+        "if (a[0] === 'pr' && a[1] === 'view') out(JSON.stringify({ state: 'MERGED', mergedAt: '2026-10-19T00:00:00Z', headRefName: 'agent/1' }));",
+        'process.exit(1);',
+        '',
+      ].join('\n'));
+      chmodSync(path.join(bin, 'gh'), 0o755);
+
+      // 假 git：一切成功；`ls-remote` 输出空（跳过残留分支清理）；`rev-parse --abbrev-ref` → master
+      writeFileSync(path.join(bin, 'git'), [
+        '#!/usr/bin/env node',
+        'const a = process.argv.slice(2);',
+        "if (a[0] === 'symbolic-ref') { process.stdout.write('master\\n'); process.exit(0); }",
+        "if (a[0] === 'rev-parse' && a.includes('--abbrev-ref')) { process.stdout.write('master\\n'); process.exit(0); }",
+        "if (a[0] === 'rev-parse') { process.stdout.write('0123456789abcdef0123456789abcdef01234567\\n'); process.exit(0); }",
+        'process.exit(0);',
+        '',
+      ].join('\n'));
+      chmodSync(path.join(bin, 'git'), 0o755);
+
+      // 假 pi：主模型（glm）在每轮都失败（真 429 原文）；回退模型第 1 次要求修改、第 2 次批准
+      writeFileSync(path.join(bin, 'pi'), [
+        '#!/usr/bin/env node',
+        "const fs = require('node:fs');",
+        'const a = process.argv.slice(2);',
+        "const sid = a[a.indexOf('--session-id') + 1] || '';",
+        "const model = a[a.indexOf('--model') + 1] || '(default)';",
+        "const log = process.env.FAKE_PI_LOG;",
+        "const prev = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\\n').filter(Boolean) : [];",
+        "fs.appendFileSync(log, JSON.stringify({ sid, model }) + '\\n');",
+        "if (!String(sid).includes('review')) { process.stdout.write('implemented\\n'); process.exit(0); }",
+        "if (String(model).includes('glm')) { process.stderr.write(process.env.FAKE_PI_ERR + '\\n'); process.exit(1); }",
+        'const fallbackReviews = prev.filter((l) => {',
+        '  try { const o = JSON.parse(l); return String(o.sid).includes("review") && !String(o.model).includes("glm"); } catch { return false; }',
+        '}).length;',
+        "process.stdout.write(fallbackReviews === 0 ? 'RESULT: REQUEST_CHANGES\\n' : 'RESULT: APPROVE\\n');",
+        'process.exit(0);',
+        '',
+      ].join('\n'));
+      chmodSync(path.join(bin, 'pi'), 0o755);
+
+      const r = spawnSync('node', [path.join(tmp, '.agent/pipeline.mjs'), 'run', '--issue', '1'], {
+        cwd: tmp, encoding: 'utf8', stdio: 'pipe',
+        env: {
+          ...process.env,
+          PATH: bin + path.delimiter + (process.env.PATH || ''),
+          PI_BIN: path.join(bin, 'pi'),
+          FAKE_GH_LOG: ghLog,
+          FAKE_PI_LOG: piLog,
+          FAKE_PI_ERR: '429: ' + RESET_ERR,
+          MODEL_HEALTH_FILE: healthFile,
+          TEST_SKIP: '1',
+          MAX_REVIEW_ROUNDS: '3',
+          REVIEW_PROVIDER: 'zai-coding-cn',
+          REVIEW_MODEL: 'glm-5.3-flash',
+          REVIEW_FALLBACK_PROVIDER: 'deepseek',
+          REVIEW_FALLBACK_MODEL: 'deepseek-v4-flash',
+        },
+      });
+
+      const problems = [];
+      const allOut = `${r.stdout || ''}\n${r.stderr || ''}`;
+      if ((r.status ?? 1) !== 0) problems.push(`run --issue exit ${r.status}: ${allOut.split('\n').slice(-3).join(' ')}`);
+      const calls = readFileSync(ghLog, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+      const prComments = calls.filter(a => a[0] === 'pr' && a[1] === 'comment');
+      const warningComments = prComments.filter(a => /审查模型不可用/.test(a.join(' ')));
+      if (warningComments.length !== 1) problems.push(`两轮审查后 PR 警告评论期望 1 条，实得 ${warningComments.length}（循环里的 state.save 覆盖了 modelWarned → 每轮重复警告）`);
+      const piCalls = readFileSync(piLog, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+      const reviewCalls = piCalls.filter(c => String(c.sid).includes('review'));
+      const primaryCalls = reviewCalls.filter(c => String(c.model).includes('glm')).length;
+      const fallbackCalls = reviewCalls.filter(c => String(c.model).includes('deepseek')).length;
+      if (primaryCalls !== 2) problems.push(`健康文件不可用时两轮都应调用主模型（期望 2 次）实得 ${primaryCalls}`);
+      if (fallbackCalls !== 2) problems.push(`回退模型审查调用期望 2 次实得 ${fallbackCalls}`);
+      let st = {};
+      try { st = JSON.parse(readFileSync(path.join(tmp, '.agent/state.json'), 'utf8')); } catch { problems.push('state.json 不可解析'); }
+      const entry = st['1'] || {};
+      if (entry.status !== 'merged') problems.push(`state#1.status 期望 merged 实得 ${entry.status}`);
+      if (entry.reviewedBy !== 'deepseek/deepseek-v4-flash') problems.push(`reviewedBy 期望回退模型实得 ${JSON.stringify(entry.reviewedBy)}`);
+      if (entry.reviewedViaFallback !== true) problems.push('reviewedViaFallback 未标为 true（回退未被标注）');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(entry.modelWarned?.['zai-coding-cn/glm-5.3-flash'] || ''))) problems.push(`state#1.modelWarned 丢失（循环里的 state.save 覆盖了它）: ${JSON.stringify(entry.modelWarned)}`);
+      const mergedComment = calls.filter(a => a[0] === 'issue' && a[1] === 'comment').map(a => a.join(' ')).find(t => /已合并/.test(t)) || '';
+      if (!/审查模型：deepseek\/deepseek-v4-flash（回退）/.test(mergedComment)) problems.push(`合并评论未写明审查模型（含“（回退）”标注）: ${mergedComment.slice(0, 200)}`);
+      problems.length ? fail(`模型健康记忆·审查循环端到端 (17e): ${problems.join('; ')}`)
+        : ok('模型健康记忆·审查循环端到端 (17e): 同一进程两轮均调用主模型（健康文件不可写）→ PR 警告仍只有 1 条、modelWarned 存活、reviewedBy/合并评论标注为回退模型');
+    } catch (e) {
+      fail(`模型健康记忆·审查循环端到端 (17e): ${e.message}`);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
   }
 }
 

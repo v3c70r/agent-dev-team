@@ -610,11 +610,15 @@ async function processIssueInner(issue, force = false) {
   if (!fresh[issue.number]) fresh[issue.number] = {}; // ensure key exists
   if (fresh[issue.number].status !== 'approved') {
     for (let r = 0; r < maxRounds; r++) {
-      fresh = state.load();
-      if (!fresh[issue.number]) fresh[issue.number] = {};
       const res = await runReviewRound(issue.number, pr.number);
       lastReviewOut = res.out;
       lastReviewVerdict = res.verdict;
+      // ⚠️ 必须**在 runReviewRound 之后**重读 state（Agent B review #1，真实 bug）：
+      // runReviewRound 内部会写 `modelWarned`（每日一次）与健康条目；旧代码在它之前
+      // load、之后 `state.save(旧对象)`（整文件覆盖）→ 把刚写的 `modelWarned` 抹掉，
+      // 下一轮读不到标记 → 同一 PR 照样每轮重复警告（issue #25 的核心验收）。
+      fresh = state.load();
+      if (!fresh[issue.number]) fresh[issue.number] = {};
       // 如实记账（issue #25）：记下**实际**给这轮结论的模型（主 or 回退），
       // 合并评论里会显式写出，这样“独立模型审查”到底谁审的可追溯。
       fresh[issue.number].reviewedBy = res.model;

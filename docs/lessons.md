@@ -878,3 +878,24 @@ function cerr(...args) { process.stderr.write(args.map(scrub).join(' ') + '\n');
   审计链是断的 —— 而这恰恰是独立审查这个卖点的唯一证据。
 - **跳过主模型的前提是存在回退模型**：没有回退时的「健康跳过」会把系统变成没有模型可用，
   所以这条判定要写成纯函数并单独测真值表（含 `hasFallback:false → true`）。
+
+**补记（Agent B review 第 1 轮）：降级状态被主流程的「先读后写」抹掉了**
+
+第一版把「每条 PR 每天只警告一次」的标记写在 `runReviewRound()` 里（`state.json` 的
+`modelWarned`），但 `processIssueInner` 的审查循环是**先 `state.load()`、再
+`await runReviewRound()`、最后 `state.save(fresh)`** —— 而 `state.save` 是**整文件覆盖**，
+`fresh` 是调用前的旧对象，于是刚写进去的 `modelWarned` 在第 3 步被抹掉。在健康文件正常可写的
+路径上，冷却跳过了主模型，这个坑被**掩盖**了；一旦健康文件写不进去（磁盘/权限/手动改坏），
+同一个 PR 又会每轮一条 ⚠️ —— 正是本 issue 要消灭的现象。
+
+修法：把 `state.load()` 挪到 `runReviewRound()` **之后**（每轮重读磁盘，天然带上它刚写的
+`modelWarned`）。断言两处，且都做过负向验证（把 bug 放回去 → 两处同时红）：
+
+- **17b** 结构断言：审查循环里 `fresh = state.load()` 必须出现在 `await runReviewRound(` 之后；
+- **17e** 端到端：真 pipeline（假 `pi`/`gh`/`git`）跑 `run --issue`，**故意让健康文件不可写**
+  （指向一个目录 → rename/read 都 EISDIR），两轮都真的调用主模型 → 断言 PR 警告评论**恰好 1 条**
+  且 `state#1.modelWarned` 仍存在。
+
+**教训**：**「记忆」写在被调用方、状态由调用方整文件覆盖 = 记忆丢失**。凡是「跨轮次/跨进程需要
+记得」的信息，要么由唯一的写者统一落盘，要么写完就重读再改；`state.save()` 这种整文件写入
+在任何 `await` 之后都必须视为「磁盘可能已被别人改过」。
