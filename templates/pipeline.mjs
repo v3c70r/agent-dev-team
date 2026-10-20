@@ -32,6 +32,13 @@
 //                                   error text carries NO parseable reset time
 //    MODEL_HEALTH_FILE              where the cooldown memory lives
 //                                   (default .agent/model-health.json, gitignored)
+//    AGENT_ALLOW_DIRTY=1            skip the pre-flight clean-worktree gate
+//                                   (issue #27). DEFAULT IS FAIL-CLOSED: a dirty
+//                                   worktree skips this tick ("waiting round") —
+//                                   `reset --hard` would DESTROY the human's
+//                                   uncommitted work and `git add -A` would commit
+//                                   it into the agent branch. Only set this when you
+//                                   explicitly accept that risk.
 // ══════════════════════════════════════════════════════════════════
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, copyFileSync, symlinkSync, rmSync, renameSync } from 'node:fs';
@@ -39,7 +46,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 // 出站凭据防线（SECRET_PATTERNS / assertNoSecrets / redactSecrets / countSecretMatches）
 // 现在只有一份实现，住在 lib.mjs（pipeline 与 pm/screen.mjs 共用）。见 docs/lessons.md #28。
-import { assertNoSecrets, classifyMergeAttempt, countSecretMatches, detectBase, formatRetryList, isRejectedIssue, makeModelHealthEntry, MERGE_BLOCKED, MERGE_MERGED, mergeIssueState, parseModelResetAt, prepareImplementerBranch, redactSecrets, REJECTED_LABEL, resolvePi, resolveTesterCommands, retryReset, SECRET_PATTERNS, selectPendingIssues, sh, shouldUsePrimary } from './lib.mjs';
+import { assessWorktree, assertNoSecrets, classifyMergeAttempt, countSecretMatches, detectBase, formatRetryList, isRejectedIssue, makeModelHealthEntry, MERGE_BLOCKED, MERGE_MERGED, mergeIssueState, parseModelResetAt, prepareImplementerBranch, redactSecrets, REJECTED_LABEL, resolvePi, resolveTesterCommands, retryReset, SECRET_PATTERNS, selectPendingIssues, sh, shouldUsePrimary } from './lib.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const AGENT = path.join(ROOT, '.agent');
@@ -252,9 +259,67 @@ function openPrFor(issueNum, branch) {
 }
 
 // ── Role A: implementer ──
+
+// 脏工作区的提示（issue #27）——**限流**：watcher 每 30s 一个 tick，若每次都发评论，
+// 用户一晚上会收到几十条同样的提示（与 issue #25 的「每轮重复 ⚠️」同类噪声）。
+// 标记落在 `state.json[issue].dirtyNotifiedAt`，同一 issue 30 分钟内只提示一次；
+// **只写这一个字段，绝不动 status** —— 该 issue 下一 tick 还要被重新拾取（等待轮语义）。
+const DIRTY_NOTIFY_INTERVAL_MS = 30 * 60_000;
+function notifyWorktreeDirty(issueNum, entries = [], reason = '') {
+  const s = state.load();
+  const last = Date.parse(String(s[issueNum]?.dirtyNotifiedAt || ''));
+  if (Number.isFinite(last) && Date.now() - last < DIRTY_NOTIFY_INTERVAL_MS) {
+    log(issueNum, '工作区仍脏：30 分钟内已提示过，本轮不重复评论（等待工作区变干净）');
+    return false;
+  }
+  s[issueNum] = mergeIssueState(s[issueNum], { dirtyNotifiedAt: new Date().toISOString() });
+  state.save(s);
+  // entries 来自人类文件名：走脱敏（审计通道不能因为命中令牌特征就丢掉整条提示）
+  const list = (entries && entries.length ? entries : ['(未返回具体文件)'])
+    .map(e => `- \`${redactSecrets(String(e))}\``).join('\n');
+  const body = [
+    '⏸ **这一轮先不开工：主工作区里有未提交的改动。**',
+    '',
+    '为了避免**销毁你的代码**，流水线在任何分支操作与模型调用之前就停下了：',
+    '没有 `git reset --hard`、没有 `git add -A`，也没有创建分支或提交。',
+    '',
+    '命中的改动（最多 5 条）：',
+    list,
+    reason ? `\ngit 读不到状态（按「脏」处理，fail-closed）：\`${redactSecrets(String(reason)).replace(/\n/g, ' ').slice(0, 300)}\`` : '',
+    '',
+    '**怎么继续**（三选一）：',
+    '1. `git stash` —— 暂存改动；工作区干净后 watcher 会自动接手（无需其它操作）。',
+    '2. 直接提交或丢弃这些改动。',
+    '3. `AGENT_ALLOW_DIRTY=1` 重启 watcher —— **明确承担风险**：未提交的改动可能被',
+    '   `reset --hard` 丢弃，或被 `git add -A` 提交进 agent 分支并推上 PR。',
+    '',
+    `_同一条提示 30 分钟内不会重复（该 issue 仍在队列里，工作区变干净后自动开始）。_`,
+  ].filter(Boolean).join('\n');
+  try { commentOnIssue(issueNum, body); } catch (e) { cwarn(`[dirty] issue #${issueNum} 提示评论失败：${e.message}`); }
+  return true;
+}
+
 async function runImplementer(issue, roundNote = '') {
   const s = state.load();
   const branch = `agent/${issue.number}`;
+  // 开工前置门（issue #27）：Agent A 跑在**用户自己的主工作区**里，`reset --hard`
+  // 会丢掉未提交改动、`git add -A` 会把它们扫进 PR。检查必须在**任何分支操作与 pi
+  // 调用之前**（docs/lessons.md #30）。脏 → 抛带类型的错误，由调用方走「等待轮」。
+  if (process.env.AGENT_ALLOW_DIRTY === '1') {
+    cwarn('⚠️ AGENT_ALLOW_DIRTY=1：已按用户请求忽略脏工作区检查 —— 未提交的改动可能被 reset --hard 丢弃，或被提交进 agent 分支（风险自负，docs/lessons.md #30）');
+    log(issue.number, 'A: 已按用户请求忽略脏工作区（AGENT_ALLOW_DIRTY=1）—— 未提交改动可能被丢弃或被提交进 PR');
+  } else {
+    const wt = assessWorktree();
+    if (wt.dirty) {
+      const err = new Error(wt.error
+        ? `工作区状态无法确认（git status --porcelain 失败，按脏处理）：${wt.error}`
+        : `工作区有未提交的改动，已跳过本轮（不会销毁、也不会提交你的改动）：${wt.entries.join(' | ')}`);
+      err.code = 'WORKTREE_DIRTY';
+      err.entries = wt.entries.slice(0, 5);
+      err.reason = wt.error || '';
+      throw err;
+    }
+  }
   const prompt = buildPrompt('implementer', { issue, branch, roundNote });
   // Fix rounds MUST continue on the PR's existing branch; only the first round
   // branches off base. `git checkout -B` on an existing branch would reset it
@@ -590,7 +655,9 @@ async function processIssueInner(issue, force = false) {
   // 1) IMPLEMENT
   // `new` 也必须进入实现：人工 `retry` 把「无 PR 的 needs_human/failed」复位成 `new`，
   // 若实现入口仍只看 `pr_open`，条目会永久卡在 waiting_pr（issue #19）。
-  if (!cur || cur.status === 'new' || (cur.status === 'pr_open' && (!pr || force))) {
+  // `!cur.status`：脏工作区等待轮会写 `dirtyNotifiedAt` 而**不动 status**（issue #27），
+  // 这种「有记录但没 status」的条目就是没开工过，必须照样进入实现。
+  if (!cur || !cur.status || cur.status === 'new' || (cur.status === 'pr_open' && (!pr || force))) {
     if (pr && !force && cur) {
       s[issue.number] = { ...cur, status: 'reviewing' };
       state.save(s);
@@ -843,7 +910,30 @@ async function main() {
       const full = issueNum
         ? (await gh(['issue', 'view', String(issueNum), '--json', 'number,title,body,labels']))
         : issue;
-      await processIssue(typeof full === 'string' ? JSON.parse(full) : full, force);
+      const it = typeof full === 'string' ? JSON.parse(full) : full;
+      try {
+        await processIssue(it, force);
+      } catch (err) {
+        // 脏工作区（issue #27）：手打 `run` 是人主动发起的一次性动作，静默跳过看起来
+        // 就是「什么都没发生」——所以这里给出可读原因 + 处置方式 + 非零退出码，
+        // 而不是让原始 git 报错直接抛出去。仍然：不建分支、不调模型、不改动任何文件。
+        if (err && err.code === 'WORKTREE_DIRTY') {
+          notifyWorktreeDirty(it.number, err.entries, err.reason);
+          log(it.number, `未开工：工作区脏（${err.message}）`);
+          cerr(err.reason
+            ? `✗ issue #${it.number} 未开工：工作区状态无法确认（git 读不到，按脏处理；未创建分支、未调用模型、未改动任何文件）`
+            : `✗ issue #${it.number} 未开工：工作区有未提交的改动（未创建分支、未调用模型、未改动任何文件）`);
+          if (err.reason) cerr(`  git: ${String(err.reason).replace(/\n/g, ' ').slice(0, 300)}`);
+          for (const e of err.entries || []) cerr(`  命中: ${e}`);
+          cerr('  处置方式（三选一）：');
+          cerr('    git stash                  # 暂存改动，工作区干净后 watcher 自动接手');
+          cerr('    提交或丢弃这些改动');
+          cerr('    AGENT_ALLOW_DIRTY=1 …      # 明确承担风险（改动可能被 reset --hard 丢弃或被提交进 PR）');
+          process.exitCode = 3;
+          return;
+        }
+        throw err;
+      }
     }
     return;
   }
@@ -975,6 +1065,16 @@ async function main() {
           await processIssue(issue);
           console.log(`[${ts()}] ✔ issue #${issue.number} 本轮结束`);
         } catch (err) {
+          // ── 等待轮（issue #27）：脏工作区不是失败，是「现在不能开工」──────────
+          // 三条路必须都**不走**：不写 needs_human（那是人工工单，会把“等两秒就好”的事变成
+          // 待办）、不上报上游（不是模板缺陷）、不改 status（该 issue 下一 tick 还要重新拾取）。
+          // 只留日志 + 限流提示（30 分钟一次）。工作区一干净，下一 tick 自动开工。
+          if (err && err.code === 'WORKTREE_DIRTY') {
+            cerr(`[${ts()}] ⏸ issue #${issue.number} 跳过本轮：工作区有未提交的改动（未建分支、未调模型、未改文件）`);
+            log(issue.number, `等待轮：工作区脏，跳过本轮（不置 needs_human、不上报上游）—— ${err.message}`);
+            notifyWorktreeDirty(issue.number, err.entries, err.reason);
+            continue;
+          }
           // one bad issue must NOT kill the long-running watcher
           cerr(`[${ts()}] ✖ issue #${issue.number} 处理失败，循环继续：${err.message}`);
           log(issue.number, `循环捕获异常（不退出）:\n${err.stack || err.message}`);

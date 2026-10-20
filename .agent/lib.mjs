@@ -163,6 +163,53 @@ export function prepareImplementerBranch({ branch, base, cwd } = {}) {
   return { reused: false };
 }
 
+// ── 开工前置门：共享工作区必须 fail-closed（issue #27）────────────────
+// Agent A 在**用户自己的主工作区**里跑，而 `prepareImplementerBranch()` 会用
+// `git reset --hard origin/<branch>`（修复轮）、`git checkout -B`（首轮），随后
+// `git add -A` + commit + push —— 未提交的人类改动要么被**丢弃**，要么被**扫进 PR**。
+// 这不是文档能挡住的事（lesson #22：文档/提示词挡不住破坏性命令），所以必须在
+// **任何分支操作与模型调用之前**用 `git status --porcelain` 起跑前拒绝（fail-closed）。
+// 成熟做法一致：larch 的 `/implement` 在创建锁与分支之前跑 `check-clean-tree.sh --fail-closed`。
+// <https://github.com/zhupanov/larch/issues/2534> · <https://git-scm.com/docs/git-status>
+
+/**
+ * 空输出（或纯空白）→ 干净；其余 → 脏。纯函数，不修改入参。
+ * 用 `--porcelain` 是脚本判定的稳定接口（不要解析人类可读的 `git status`）。
+ */
+export function isWorktreeDirty(porcelainOutput) {
+  return String(porcelainOutput ?? '').trim() !== '';
+}
+
+/**
+ * 取前 `max` 条**非空**行，保留 `XY PATH` 的状态码（评论/日志里要能看出是改了还是新文件）。
+ * 纯函数，不修改入参。
+ */
+export function summarizePorcelain(porcelainOutput, max = 5) {
+  const limit = Number.isFinite(Number(max)) && Number(max) >= 0 ? Number(max) : 5;
+  return String(porcelainOutput ?? '')
+    .split(/\r?\n/)
+    .map(l => l.replace(/\s+$/, ''))
+    .filter(l => l.trim() !== '')
+    .slice(0, limit);
+}
+
+/**
+ * 读一次工作区的干净程度。
+ *   `{ dirty: false, entries: [] }`            → 可以开工
+ *   `{ dirty: true,  entries: [≤5 条] }`       → 有未提交改动
+ *   `{ dirty: true,  entries: [], error }`     → **git 调用失败 → 按脏处理**（fail-closed）
+ * 最后一条是刻意的：读不到状态时放行，等于把「不知道」当成「干净」，
+ * 而代价是不可逆的（reset --hard 丢掉人类代码）。
+ */
+export function assessWorktree({ cwd } = {}) {
+  try {
+    const out = sh(['git', 'status', '--porcelain'], { cwd });
+    return { dirty: isWorktreeDirty(out), entries: summarizePorcelain(out) };
+  } catch (e) {
+    return { dirty: true, entries: [], error: String((e && (e.stderr || e.message)) || e || '') };
+  }
+}
+
 // State updates must MERGE, never replace: overwriting an issue entry with a
 // fresh `{round:0,fixes:0}` erased the review round the loop had just recorded,
 // so state.json could not remember that any fix round happened (lesson #19).

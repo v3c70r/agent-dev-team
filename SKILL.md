@@ -234,10 +234,28 @@ pipeline 在开工前会检查这些前置 issue：**只要有未关闭的，就
 | **提前清除冷却** | `rm .agent/model-health.json`（或删掉其中该模型的条目）—— 例如你已充值/换额度，不想等重置时间；也可以 `MODEL_COOLDOWN_MIN` 调小「解析不出重置时间」时的默认冷却（默认 30 分钟） |
 | 安全边界 | **没有配置 `reviewFallback*` 时永不跳过主模型**（跳过 = 没有模型可用） |
 
+### 工作区脏了怎么办（开工前置门，issue #27）
+
+Agent A 跑在**你自己的主工作区**里，修复轮的 `git reset --hard` 会**丢弃**未提交改动、
+随后的 `git add -A` 会把它们**扫进 PR**。所以开工前有一道 fail-closed 门：
+
+| 情况 | 行为 |
+|---|---|
+| 工作区脏（`git status --porcelain` 非空） | **本 tick 不开工**：不建分支、不调模型、不动你任何文件；issue 上留 1 条提示（列出前 5 条命中路径） |
+| 提示限流 | `state.json[issue].dirtyNotifiedAt`，同一 issue **30 分钟**内只提示一次 |
+| `state` | **不**写 `needs_human`、**不**上报上游、**不改** status —— 这是「等待轮」，工作区一干净下一 tick 自动接手 |
+| git 读不到状态 | 按**脏**处理（fail-closed：把“不知道”当“干净”的代价不可逆） |
+| `AGENT_ALLOW_DIRTY=1` | 跳过检查，但终端与日志都留醒目警告（风险自负） |
+
+三种处置方式（任选）：`git stash`（干净后自动继续）｜提交或丢弃改动｜`AGENT_ALLOW_DIRTY=1`
+明确承担风险。完整事故与论证见 [`docs/lessons.md`](docs/lessons.md) #30。
+
 ## 必须遵守的坑位规则（全部来自真实事故，见 docs/lessons.md）
 
-1. **watcher 运行时绝不在该仓库工作区手动改文件** —— Agent A 会 `git add -A` +
-   `reset --hard`。要改代码：先 `tmux kill-session -t agent`，改完提交，再启动。
+1. **watcher 运行时尽量不在该仓库工作区手动改文件** —— 但这不再是“只靠你记得”的约定
+   （lessons #30）：开工前会检查 `git status --porcelain`，脏工作区就**跳过本 tick 并提示**
+   （不会 `reset --hard` 销毁你的改动，也不 `git add -A` 扫进 PR）；工作区干净后自动继续。
+   `AGENT_ALLOW_DIRTY=1` 可强制跳过检查（**明确承担风险**）。
 2. pi 二进制解析已内置防 PATH 污染逻辑（npm 会把 node_modules/.bin 插到最前）。
 3. PR 查询按 head 分支（搜索索引有延迟）；单账号不能 self-approve，已有评论降级。
 4. Agent C 用**分离式 worktree**（agent 分支正被主工作区占用）。

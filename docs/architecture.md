@@ -149,8 +149,14 @@ pr_open  ─ retry → 拒绝（无需重试）
 
 - **Agent C 用独立 worktree**：不污染主工作区，也不与 agent 分支冲突。
 - **PM 用独立 worktree**：从 `origin/<base>` 拉取，不干扰实现流水线。
-- **但 Agent A 在主工作区工作**：因此必须遵守"watcher 运行时不要手动改文件"。
-  若要多任务并行，应改为每个 issue 一个 worktree（模板未默认开启，属于已知扩展点）。
+- **Agent A 在主工作区工作**，所以开工前有一道 **fail-closed 前置门**（lessons #30）：
+  `runImplementer()` 在**任何分支操作与模型调用之前**跑 `git status --porcelain`；
+  工作区脏（或 git 读不到状态）就**不开工** —— 因为修复轮的 `reset --hard` 会**丢弃**
+  未提交改动、随后的 `git add -A` 会把它们**扫进 PR**。
+  语义是**等待轮**：本 tick 跳过、**不**写 `needs_human`、**不**上报，只留日志 + 在 issue 上
+  限流提示一次（`state[issue].dirtyNotifiedAt`，30 分钟）；工作区一干净，下一 tick 自动开工。
+  `AGENT_ALLOW_DIRTY=1` 是显式逃生门，会留醒目警告。
+  多任务并行仍应改为每个 issue 一个 worktree（模板未默认开启，属已知扩展点）。
 
 ## 成本模型
 
