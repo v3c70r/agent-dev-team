@@ -82,6 +82,7 @@ pi 会按 [`SKILL.md`](SKILL.md) 的步骤：做 preflight 检查 → 询问你�
 | `TEST_ENV_FILE` | 仓库 `.env` | 测试所需密钥的 env 文件路径（supervisor 自动注入） |
 | `AGENT_BUILD_CMD` | `npm run build` | Agent C 的构建命令（shell 字符串，如 `make build`；空串=跳过该步骤） |
 | `AGENT_TEST_CMD` | `npm test` | Agent C 的测试命令（如 `pytest -q`；空串=跳过；**非 npm 仓库必须设置**） |
+| `AGENT_ALLOW_DIRTY` | — | `=1` **跳过开工前的工作区检查**（脏工作区默认跳过本 tick 并提示，不销毁/不提交你的改动）—— 仅在明确承担「未提交改动可能被 `reset --hard` 丢弃或被扫进 PR」的风险时使用（lessons #30） |
 | `PM_DAILY_CAP` / `PM_WEEKLY_CAP` | 1 / 5 | PM 提案上限 |
 | `SCREEN_PROVIDER` / `SCREEN_MODEL` | `deepseek` / `deepseek-v4-flash` | 提案筛选模型 |
 | `SCREEN_AUTO_APPROVE` | 1（config `screenAutoApprove`） | 筛选通过即自动实现 |
@@ -121,7 +122,11 @@ pi 会按 [`SKILL.md`](SKILL.md) 的步骤：做 preflight 检查 → 询问你�
 
 ## 已知限制
 
-- Agent A 在主工作区工作，因此**watcher 运行时不要手动改该仓库文件**（用 `tmux kill-session -t agent` 暂停）。
+- Agent A 在主工作区工作，但**开工前会检查工作区**：检测到未提交改动（`git status --porcelain`）
+  时会**跳过并提示**（不会销毁、也不会提交你的改动），工作区干净后自动继续。
+  要改这个仓库的代码：`git stash`（或提交）后等 ≤1 个 tick（30s），
+  或 `tmux kill-session -t agent` 暂停。`AGENT_ALLOW_DIRTY=1` 可**强制**跳过检查 ——
+  明确承担风险（改动可能被 `reset --hard` 丢弃或被扫进 PR）。
   多 issue 并行需要改成 per-issue worktree（属扩展点，未默认开启）。
 - 需要一台常在线的机器（笔记本休眠期间不处理）。
 - 单账号下 B 无法提交正式 approve review，模板会降级为评论记录（不影响合并）。

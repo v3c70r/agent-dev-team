@@ -899,3 +899,74 @@ function cerr(...args) { process.stderr.write(args.map(scrub).join(' ') + '\n');
 **教训**：**「记忆」写在被调用方、状态由调用方整文件覆盖 = 记忆丢失**。凡是「跨轮次/跨进程需要
 记得」的信息，要么由唯一的写者统一落盘，要么写完就重读再改；`state.save()` 这种整文件写入
 在任何 `await` 之后都必须视为「磁盘可能已被别人改过」。
+
+---
+
+## 30. 共享工作区必须 fail-closed：文档规则挡不住 `reset --hard`
+
+**现象**：这是本产品**唯一会销毁用户数据**的路径。Agent A 在**用户自己的主工作区**里跑，
+而开工前对「工作区脏不脏」零检查（`grep -n "porcelain\|dirty" templates/` 当时零命中）：
+
+- `templates/lib.mjs:159`（`prepareImplementerBranch()` 的修复轮）：`git reset --hard origin/<branch>`
+  —— Git 权威语义里 `--hard` 会**丢弃工作区与索引中的改动**（<https://git-scm.com/docs/git-reset>）。
+  人类编辑到一半的文件就这样没了。
+- `templates/pipeline.mjs:332`（`runImplementer()`）：随后 `git add -A` + commit + push
+  —— 若首轮的 `git checkout -B` 把不冲突的本地改动带到了 agent 分支，这些改动会被**提交进
+  agent 分支并推上 PR**（lesson #9 的同一类事故，只是这次被扫走的是人类的工作）。
+
+**根因**：这条路径早就出过事故（lesson #10「我在 watcher 运行期间编辑 `pipeline.mjs`，
+随后发现改动消失」），但当时的「修复」只是把「watcher 运行时不要改工作区」写成**文档规则**
+（`README.md` 的已知限制、`SKILL.md` 的坑位规则第 1 条）。这正是 lesson #22 学到的教训：
+**文档/提示词挡不住破坏性命令**。任何「人类可能正在用这个工作区」的系统，都必须把
+「起跑前拒绝」写成代码，而不是写成一句请求。
+
+现场演示（2026-10-20）：某次 PM 运行期间主仓库 `git status` 就是 `M docs/product-review.md`。
+此刻若有 issue 被拾起，这份未提交的评审笔记可能被 `reset --hard` 抹掉（修复轮路径），
+或被 `add -A` 提交进别人的 PR（首轮路径）——两条路都不该发生。
+
+**外部同类做法**：起跑前的 clean-tree 门是 agent runner 的标准件 —— larch 的 `/implement` /
+`/fix-issue` 在**创建锁与分支之前**跑 `check-clean-tree.sh --fail-closed`（内部就是
+`git status --porcelain`），说明「脏工作区起跑」是这类系统的共性缺陷，正确姿势是**起跑前拒绝**，
+而不是事后恢复（<https://github.com/zhupanov/larch/issues/2534>）。`git status --porcelain`
+是脚本判断「工作区是否干净」的稳定接口（<https://git-scm.com/docs/git-status>）；
+长期正解是官方多工作树 `git worktree`（<https://git-scm.com/docs/git-worktree>，Agent C / PM
+早就在用），per-issue worktree 属后续改造，本 PR 只做止血。
+
+**修复**（纯确定性，无 LLM）：
+
+1. `lib.isWorktreeDirty(porcelain)`：空串/纯空白 → 干净，其余 → 脏。
+   `lib.summarizePorcelain(porcelain, max = 5)`：保留 `XY PATH` 状态码、最多 5 条（评论/日志用）。
+   `lib.assessWorktree({ cwd })` → `{ dirty, entries, error? }`，**git 调用失败时 `error` 非空且
+   `dirty: true`**（fail-closed：读不到状态时放行，等于把「不知道」当成「干净」，而代价不可逆）。
+2. `pipeline.runImplementer()` 在**任何分支操作与 pi 调用之前**（`prepareImplementerBranch()`
+   之前）检查 `assessWorktree()`；脏 → 抛带类型的错误 `err.code = 'WORKTREE_DIRTY'`
+   （`err.entries` 带 ≤5 条命中路径），**不** checkout / reset / `add -A`，**不**调用 pi
+   —— 脏工作区一次模型调用都不花。
+3. **脏 = 等待轮，不是失败**（设计取舍）：watch 的 catch 见到 `WORKTREE_DIRTY` 时
+   **不写 `needs_human`**（那是要人类处理的工单，会把「等两秒就好」变成待办，还会永久跳过该
+   issue）、**不上报** `[skill-feedback]`（不是模板缺陷）、**不改 `state.json` 的 status**
+   （下一 tick 还要重新拾取），只留日志 + 在 issue 上**限流提示**：`state[issue].dirtyNotifiedAt`，
+   同一 issue 30 分钟内只提示一次（watcher 每 30s 一个 tick，否则会刷屏 —— lesson #29 同类噪声）。
+   提示正文列出命中的前 5 条路径与三种处置方式（`git stash` ｜ 提交/丢弃 ｜ `AGENT_ALLOW_DIRTY=1`
+   明确承担风险）。工作区一干净，下一 tick 自动开工，吞吐不受影响。
+4. `AGENT_ALLOW_DIRTY=1`：跳过检查，但终端 `cwarn` 醒目警告 + 日志写明「已按用户请求忽略脏工作区」
+   （逃生门必须留下痕迹，否则下一个人只会看到自己被销毁的代码）。
+5. `run --issue N`（非 watch）路径同样前置检查：手打 `run` 是人主动发起的一次性动作，
+   静默跳过看起来就是「什么都没发生」——所以给出可读原因 + 处置方式 + **非零退出码**。
+6. 断言（`scripts/validate.mjs` 18）：纯函数真值表；**真 git 仓库**集成（干净 → 改文件 → 脏 →
+   `git stash` / `checkout -- .` 恢复干净；非 git 目录 → fail-closed）；装配断言
+   （`assessWorktree(` / `WORKTREE_DIRTY` 必须出现在 `prepareImplementerBranch(` / `'add','-A'` /
+   `runPi(` **之前**，且等待轮分支里**没有** `'needs_human'` 与 `reportGap(`）；
+   离线端到端（真 git + 假 `gh`/`pi`：脏 → 无分支创建、pi 零调用、前后 `git diff` 一致、
+   只收到 1 条提示、state 无 `needs_human`、无上游 feedback、30 分钟内不重复提示；
+   `AGENT_ALLOW_DIRTY=1` → 检查跳过且有醒目警告）。做过负向验证：把前置门整段删掉 →
+   18c/18d/18e 同时变红。
+
+**教训**：
+
+- **凡是「人类可能正在用这个工作区」的地方，都必须起跑前 fail-closed**：`git reset --hard`
+  与 `git add -A` 一个是**销毁**、一个是**泄露**，两者都不属于「事后可以恢复」的范围。
+- **失败语义要分清**：脏工作区是「现在不能开工」（等待轮），不是「这个 issue 失败了」。
+  把可自愈的等待写成 `needs_human`，等于用人工工单换一次自动重试。
+- **读不到状态 ≠ 干净**：判定的默认值必须选「不造成不可逆损失」的那一边。
+- **逃生门（`AGENT_ALLOW_DIRTY=1`）要留痕**：显式承担风险是允许的，静默承担不行。

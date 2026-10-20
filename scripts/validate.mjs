@@ -1514,5 +1514,393 @@ let doctorHumanOut = '';
   }
 }
 
+// 18. 开工前必须检查工作区：共享工作区 fail-closed（issue #27）————————————
+//     事故链：`prepareImplementerBranch()` 的 `git reset --hard origin/<branch>`（修复轮）会
+//     **丢弃**工作区/索引里的改动；首轮的 `checkout -B` 会把不冲突的改动带到 agent 分支上，
+//     随后 `git add -A` + commit + push 把它们**推上 PR**。两条路都在销毁/泄露人类的工作，
+//     而当时唯一的防线是文档（README「不要手动改文件」）—— lesson #22：文档挡不住破坏性命令。
+//     这里锁住四件事：纯判定 / 真 git 仓库行为 / 检查在破坏性命令之前 / 脏 = **等待轮**。
+{
+  const problems = [];
+
+  // 18a. 纯函数：isWorktreeDirty / summarizePorcelain（不修改入参）
+  if (typeof lib.isWorktreeDirty !== 'function' || typeof lib.summarizePorcelain !== 'function' || typeof lib.assessWorktree !== 'function') {
+    fail('templates/lib.mjs 缺少 isWorktreeDirty() / summarizePorcelain() / assessWorktree()');
+  } else {
+    for (const c of ['', '   ', '\n', ' \n\t ']) {
+      if (lib.isWorktreeDirty(c) !== false) problems.push(`isWorktreeDirty(${JSON.stringify(c)}) 应为 false`);
+    }
+    for (const c of [' M a.txt', '?? b.txt', 'M  c', 'A  d\n M e']) {
+      if (lib.isWorktreeDirty(c) !== true) problems.push(`isWorktreeDirty(${JSON.stringify(c)}) 应为 true`);
+    }
+    const many = [' M a', '?? b', 'M  c', ' D d', 'R  e', 'A  f', '', '   '].join('\n');
+    const sum = lib.summarizePorcelain(many);
+    if (sum.length !== 5) problems.push(`summarizePorcelain 应截断到 5 条，实得 ${sum.length}`);
+    // 状态码（XY）必须原样保留：评论里要能看出「改了」还是「新文件」
+    if (sum.join('|') !== ' M a|?? b|M  c| D d|R  e') problems.push(`状态码/顺序被破坏: ${JSON.stringify(sum)}`);
+    if (sum.some(l => String(l).trim() === '')) problems.push('summarizePorcelain 返回了空行');
+    if (lib.summarizePorcelain(many, 2).length !== 2) problems.push('summarizePorcelain 的 max 参数未生效');
+    if (lib.summarizePorcelain('').length !== 0) problems.push('空输入的 summarizePorcelain 应返回空数组');
+    if (many !== [' M a', '?? b', 'M  c', ' D d', 'R  e', 'A  f', '', '   '].join('\n')) problems.push('summarizePorcelain 修改了入参');
+    problems.length ? fail(`工作区判定纯函数 (18a): ${problems.join('; ')}`)
+      : ok('工作区判定纯函数 (18a): 空/空白=干净；` M`/`??`/`M ` = 脏；summarizePorcelain 截断到 5 条、无空行、保留状态码、不修改入参');
+  }
+
+  // 18b. 真 git 仓库集成：干净 → 改文件 → 脏 → 恢复干净；git 失败 → 按脏处理（fail-closed）
+  {
+    const g = (cwd, ...args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: 'pipe' }).trim();
+    const tmp = mkdtempSync(path.join(os.tmpdir(), 'agent-dirty-lib-'));
+    const work = path.join(tmp, 'work');
+    const notRepo = path.join(tmp, 'not-a-repo');
+    try {
+      mkdirSync(work, { recursive: true });
+      mkdirSync(notRepo, { recursive: true });
+      g(tmp, 'init', '-b', 'master', work);
+      g(work, 'config', 'user.email', 'agent@test.local');
+      g(work, 'config', 'user.name', 'Agent Test');
+      writeFileSync(path.join(work, 'notes.txt'), 'line1\n');
+      g(work, 'add', '-A');
+      g(work, 'commit', '-m', 'base');
+
+      const clean = lib.assessWorktree({ cwd: work });
+      if (clean.dirty !== false || (clean.entries || []).length) problems.push(`干净仓库应为 dirty:false/entries:[]，实得 ${JSON.stringify(clean)}`);
+      if ('error' in clean && clean.error) problems.push(`干净仓库不应带 error: ${clean.error}`);
+
+      // 未提交改动（正是「人类编辑到一半」的形状）→ 脏，且条目里能看到文件名
+      writeFileSync(path.join(work, 'notes.txt'), 'line1\nhuman wip\n');
+      const dirty = lib.assessWorktree({ cwd: work });
+      if (dirty.dirty !== true) problems.push(`改动后应为 dirty:true，实得 ${JSON.stringify(dirty)}`);
+      if (!dirty.entries.some(e => e.includes('notes.txt'))) problems.push(`entries 未列出命中文件: ${JSON.stringify(dirty.entries)}`);
+
+      // 未跟踪文件同样是「人类的工作」，同样算脏（`git add -A` 会把它们扫进 PR）
+      writeFileSync(path.join(work, 'scratch.md'), 'draft\n');
+      const untracked = lib.assessWorktree({ cwd: work });
+      if (!untracked.entries.some(e => /^\?\?/.test(e) && e.includes('scratch.md'))) problems.push(`未跟踪文件未被识别为脏: ${JSON.stringify(untracked.entries)}`);
+
+      // 两种人类常见处置 → 恢复干净
+      g(work, 'checkout', '--', 'notes.txt');
+      const stillDirty = lib.assessWorktree({ cwd: work });
+      if (!stillDirty.dirty) problems.push('只剩未跟踪文件时仍应为脏');
+      rmSync(path.join(work, 'scratch.md'));
+      writeFileSync(path.join(work, 'notes.txt'), 'line1\nhuman wip\n');
+      g(work, 'stash', 'push', '-q');
+      const stashed = lib.assessWorktree({ cwd: work });
+      if (stashed.dirty !== false) problems.push(`git stash 后应恢复干净，实得 ${JSON.stringify(stashed)}`);
+
+      // **fail-closed**：git 命令失败（不是 git 仓库 / 权限 / 磁盘）→ 按脏处理，不静默放行
+      const bad = lib.assessWorktree({ cwd: notRepo });
+      if (bad.dirty !== true) problems.push(`git 失败时必须按脏处理（fail-closed），实得 ${JSON.stringify(bad)}`);
+      if (!bad.error) problems.push('git 失败时 error 应非空（便于调用方/人类排障）');
+
+      problems.length ? fail(`工作区判定·真 git 集成 (18b): ${problems.join('; ')}`)
+        : ok('工作区判定·真 git 集成 (18b): 干净/改动/未跟踪/stash 恢复均正确；git 失败按脏处理（fail-closed）');
+    } catch (e) {
+      fail(`工作区判定·真 git 集成 (18b): ${e.message}`);
+    } finally { rmSync(tmp, { recursive: true, force: true }); }
+  }
+
+  // 18c. 装配断言：检查必须在**破坏性命令之前**；脏 = 等待轮（不得写 needs_human / 不得上报）
+  {
+    const miss = [];
+    const pipe = readFileSync(path.join(ROOT, 'templates/pipeline.mjs'), 'utf8');
+    const libSrc = readFileSync(path.join(ROOT, 'templates/lib.mjs'), 'utf8');
+    const impl = pipe.split('async function runImplementer(')[1]?.split('// ── Role B')[0] || '';
+    const iCheck = impl.indexOf('assessWorktree(');
+    const iBranch = impl.indexOf('prepareImplementerBranch(');
+    const iAddAll = impl.indexOf("'add', '-A'");
+    const iPi = impl.indexOf('runPi(');
+    if (iCheck === -1) miss.push('runImplementer() 未调用 assessWorktree()');
+    if (!/err\.code = 'WORKTREE_DIRTY'/.test(impl)) miss.push("runImplementer() 未抛 err.code = 'WORKTREE_DIRTY'");
+    if (!/err\.entries = /.test(impl)) miss.push('WORKTREE_DIRTY 错误未带 entries（评论里无法列出命中的文件）');
+    if (iCheck === -1 || iBranch === -1 || iCheck > iBranch) miss.push('assessWorktree() 必须出现在 prepareImplementerBranch() 之前（否则 reset --hard / checkout 已经跑过了）');
+    if (!/'reset', '--hard'/.test(libSrc)) miss.push("lib.mjs 的 reset --hard 不见了（断言失去意义）");
+    if (iCheck === -1 || iAddAll === -1 || iAddAll < iCheck) miss.push("git add -A 必须在工作区检查之后（否则改动已被扫进 commit）");
+    if (iCheck === -1 || iPi === -1 || iPi < iCheck) miss.push('assessWorktree() 必须在 pi 调用之前（脏工作区不得消耗任何模型调用）');
+    // AGENT_ALLOW_DIRTY=1 是**显式承担风险**，必须留醒目警告（不能静默跳过）
+    if (!/AGENT_ALLOW_DIRTY/.test(impl)) miss.push('runImplementer() 未处理 AGENT_ALLOW_DIRTY=1');
+    else {
+      const allow = impl.split("process.env.AGENT_ALLOW_DIRTY === '1'")[1]?.split('} else {')[0] || '';
+      if (!/cwarn\(/.test(allow)) miss.push('AGENT_ALLOW_DIRTY=1 未在终端留醒目警告');
+      if (!/log\(issue\.number/.test(allow)) miss.push('AGENT_ALLOW_DIRTY=1 未在日志写明「已按用户请求忽略脏工作区」');
+    }
+
+    // watch 的 catch：WORKTREE_DIRTY → 等待轮（continue），不得落入 needs_human / reportGap
+    const watch = pipe.split('// watch loop')[1] || '';
+    const iMarker = watch.indexOf("err.code === 'WORKTREE_DIRTY'");
+    const iCont = iMarker === -1 ? -1 : watch.indexOf('continue;', iMarker);
+    if (iMarker === -1) miss.push('watch 的 catch 未分支处理 WORKTREE_DIRTY');
+    if (iMarker !== -1 && iCont === -1) miss.push('WORKTREE_DIRTY 分支没有 continue（会继续走失败路径）');
+    const seg = iMarker === -1 ? '' : watch.slice(iMarker, iCont === -1 ? iMarker + 700 : iCont + 9);
+    if (/'needs_human'/.test(seg)) miss.push('WORKTREE_DIRTY 分支包含 needs_human（脏工作区不是失败，会变成人工工单且不再自动接手）');
+    if (/reportGap\(/.test(seg)) miss.push('WORKTREE_DIRTY 分支包含 reportGap（不是模板缺陷，会刷上游噪声）');
+    const iNh = watch.indexOf("status = 'needs_human'");
+    if (iNh === -1) miss.push('watch 的通用失败处理不见了（断言失去意义）');
+    else if (iMarker === -1 || iMarker > iNh) miss.push('WORKTREE_DIRTY 分支必须在写 needs_human 之前');
+    // 限流：同一 issue 30 分钟内只提示一次
+    if (!/dirtyNotifiedAt/.test(pipe)) miss.push('缺少 state.json[issue].dirtyNotifiedAt（提示会每 30s 刷一条）');
+    if (!/DIRTY_NOTIFY_INTERVAL_MS\s*=\s*30 \* 60_000/.test(pipe)) miss.push('提示限流窗口不是 30 分钟');
+    // `run --issue`（非 watch）路径也必须前置检查，且错误可读 + 非零退出
+    const runBranch = pipe.split("if (cmd === 'run') {")[1]?.split("if (cmd === 'retry') {")[0] || '';
+    if (!/WORKTREE_DIRTY/.test(runBranch)) miss.push("`run --issue` 路径未处理 WORKTREE_DIRTY（会静默放行）");
+    if (/process\.exitCode/.test(runBranch) === false) miss.push('`run --issue` 遇到脏工作区未给出非零退出码');
+
+    miss.length ? fail(`工作区前置门·装配 (18c): ${miss.join('; ')}`)
+      : ok('工作区前置门·装配 (18c): assessWorktree() 在 prepareImplementerBranch()/git add -A/pi 之前；WORKTREE_DIRTY 走等待轮（无 needs_human / 无 reportGap）；run 路径同样前置检查且非零退出；AGENT_ALLOW_DIRTY 有醒目警告');
+  }
+
+  // 18d. 离线端到端·**真 git + 假 gh/pi**：临时仓库里制造未提交改动后跑实现路径
+  //      期待：不创建分支 / 不调 pi / 文件内容不变（前后 git diff 一致）/ issue 只收到 1 条提示 /
+  //      state 里**没有** needs_human、也**不**新增上游 [skill-feedback]。
+  {
+    const tmp = mkdtempSync(path.join(os.tmpdir(), 'agent-dirty-e2e-'));
+    try {
+      const g = (cwd, ...args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: 'pipe' }).trim();
+      mkdirSync(path.join(tmp, '.agent'), { recursive: true });
+      copyFileSync(path.join(ROOT, 'templates/pipeline.mjs'), path.join(tmp, '.agent/pipeline.mjs'));
+      copyFileSync(path.join(ROOT, 'templates/lib.mjs'), path.join(tmp, '.agent/lib.mjs'));
+      writeFileSync(path.join(tmp, '.agent/state.json'), '{}');
+      writeFileSync(path.join(tmp, '.agent/config.json'), JSON.stringify({ upstream: 'acme/agent-dev-team', feedbackOptIn: true }, null, 2));
+      // 真实 git 仓库：`.agent/` 等运行时文件进 .gitignore，这样「脏」只来自人类的改动
+      writeFileSync(path.join(tmp, '.gitignore'), '.agent/\nbin/\n*.log\n');
+      writeFileSync(path.join(tmp, 'notes.txt'), 'line1\n');
+      g(tmp, 'init', '-b', 'master');
+      g(tmp, 'config', 'user.email', 'agent@test.local');
+      g(tmp, 'config', 'user.name', 'Agent Test');
+      g(tmp, 'add', '-A');
+      g(tmp, 'commit', '-m', 'base');
+      // 人类的未提交改动（现场演示的形状：M docs/product-review.md）
+      writeFileSync(path.join(tmp, 'notes.txt'), 'line1\nhuman wip\n');
+      const diffBefore = g(tmp, 'diff');
+
+      const bin = path.join(tmp, 'bin');
+      mkdirSync(bin, { recursive: true });
+      const ghLog = path.join(tmp, 'gh-calls.log');
+      const piLog = path.join(tmp, 'pi-calls.log');
+      writeFileSync(ghLog, ''); writeFileSync(piLog, '');
+      writeFileSync(path.join(bin, 'gh'), [
+        '#!/usr/bin/env node',
+        'const a = process.argv.slice(2);',
+        "const fs = require('node:fs');",
+        "const rec = () => fs.appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify(a) + '\\n');",
+        "const out = (s) => { process.stdout.write(s); process.exit(0); };",
+        "if (a[0] === 'issue' && a[1] === 'view') out(JSON.stringify({ number: 7, title: 't', body: '', labels: [] }));",
+        "if (a[0] === 'issue' && a[1] === 'list') out('[]');",
+        "if (a[0] === 'issue' && ['comment','create'].includes(a[1])) { rec(); process.exit(0); }",
+        'process.exit(1);',
+        '',
+      ].join('\n'));
+      chmodSync(path.join(bin, 'gh'), 0o755);
+      writeFileSync(path.join(bin, 'pi'), [
+        '#!/usr/bin/env node',
+        "const fs = require('node:fs');",
+        'const a = process.argv.slice(2);',
+        "fs.appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify(a) + '\\n');",
+        "process.stdout.write('implemented\\n');",
+        'process.exit(0);',
+        '',
+      ].join('\n'));
+      chmodSync(path.join(bin, 'pi'), 0o755);
+
+      const run = (extraEnv = {}) => {
+        const r = spawnSync('node', [path.join(tmp, '.agent/pipeline.mjs'), 'run', '--issue', '7'], {
+          cwd: tmp, encoding: 'utf8', stdio: 'pipe',
+          env: { ...process.env, PATH: bin + path.delimiter + (process.env.PATH || ''), FAKE_GH_LOG: ghLog, FAKE_PI_LOG: piLog, TEST_SKIP: '1', ...extraEnv },
+        });
+        return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
+      };
+      const ghCalls = () => readFileSync(ghLog, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+      const piCalls = () => readFileSync(piLog, 'utf8').split('\n').filter(Boolean);
+
+      // ── 第 1 次：脏 → 拒绝开工
+      const r1 = run();
+      const p = [];
+      if (r1.code === 0) p.push('脏工作区时 run 应以非零退出（不得静默放行）');
+      if (piCalls().length !== 0) p.push(`脏工作区时不应调用 pi（实调 ${piCalls().length} 次）`);
+      let branchExists = true;
+      try { g(tmp, 'rev-parse', '--verify', 'agent/7'); } catch { branchExists = false; }
+      if (branchExists) p.push('脏工作区时不应创建 agent/7 分支');
+      if (g(tmp, 'diff') !== diffBefore) p.push('脏工作区时人类改动被改动了（前后的 git diff 不一致）');
+      if (!/human wip/.test(readFileSync(path.join(tmp, 'notes.txt'), 'utf8'))) p.push('notes.txt 的未提交改动被销毁了');
+      const comments1 = ghCalls().filter(a => a[0] === 'issue' && a[1] === 'comment');
+      if (comments1.length !== 1) p.push(`issue 提示评论期望 1 条实得 ${comments1.length}`);
+      const body1 = String(comments1[0]?.[comments1[0].indexOf('--body') + 1] || '');
+      if (!/未提交的改动/.test(body1)) p.push('提示评论未说明「工作区有未提交改动」');
+      if (!/notes\.txt/.test(body1)) p.push('提示评论未列出命中的文件');
+      if (!/git stash/.test(body1) || !/AGENT_ALLOW_DIRTY=1/.test(body1)) p.push('提示评论缺处置方式（git stash / AGENT_ALLOW_DIRTY=1）');
+      if (ghCalls().some(a => a[0] === 'issue' && a[1] === 'create')) p.push('脏工作区不应上报上游 [skill-feedback]（不是模板缺陷）');
+      let st = {};
+      try { st = JSON.parse(readFileSync(path.join(tmp, '.agent/state.json'), 'utf8')); } catch { p.push('state.json 不可解析'); }
+      if (st['7']?.status === 'needs_human') p.push('脏工作区时 state 不应写 needs_human（这是等待轮，不是失败）');
+      if (st['7']?.status !== undefined) p.push(`脏工作区时不应改 state status（实得 ${JSON.stringify(st['7']?.status)}）`);
+      if (!/^\d{4}-\d{2}-\d{2}T/.test(String(st['7']?.dirtyNotifiedAt || ''))) p.push(`state 缺少 dirtyNotifiedAt: ${JSON.stringify(st['7'])}`);
+      p.length ? fail(`脏工作区·实现路径端到端 (18d): ${p.join('; ')}`)
+        : ok('脏工作区·实现路径端到端 (18d): 无分支创建 / pi 零调用 / 文件内容不变 / 仅 1 条限流提示 / state 无 needs_human 且无上游 feedback');
+
+      // ── 第 2 次：30 分钟内不重复提示（watcher 每 30s 一个 tick，否则会刷屏）
+      const r2 = run();
+      const p2 = [];
+      if (r2.code === 0) p2.push('第 2 次仍脏时也应非零退出');
+      const comments2 = ghCalls().filter(a => a[0] === 'issue' && a[1] === 'comment');
+      if (comments2.length !== 1) p2.push(`30 分钟内不应重复提示（累计评论期望 1 条实得 ${comments2.length}）`);
+      if (piCalls().length !== 0) p2.push('第 2 次仍不应调用 pi');
+      p2.length ? fail(`脏工作区提示限流 (18d): ${p2.join('; ')}`)
+        : ok('脏工作区提示限流 (18d): 同一 issue 30 分钟内只提示一次（不刷屏），且始终不调用模型');
+    } catch (e) {
+      fail(`脏工作区·实现路径端到端 (18d): ${e.message}`);
+    } finally { rmSync(tmp, { recursive: true, force: true }); }
+  }
+
+  // 18e. AGENT_ALLOW_DIRTY=1：检查被跳过，但必须留醒目警告（不能静默跳过）
+  {
+    const tmp = mkdtempSync(path.join(os.tmpdir(), 'agent-dirty-allow-'));
+    try {
+      mkdirSync(path.join(tmp, '.agent/prompts'), { recursive: true });
+      copyFileSync(path.join(ROOT, 'templates/pipeline.mjs'), path.join(tmp, '.agent/pipeline.mjs'));
+      copyFileSync(path.join(ROOT, 'templates/lib.mjs'), path.join(tmp, '.agent/lib.mjs'));
+      copyFileSync(path.join(ROOT, 'templates/prompts/implementer.md'), path.join(tmp, '.agent/prompts/implementer.md'));
+      writeFileSync(path.join(tmp, '.agent/state.json'), '{}');
+      writeFileSync(path.join(tmp, '.agent/config.json'), JSON.stringify({ upstream: 'acme/agent-dev-team', feedbackOptIn: true }, null, 2));
+      const bin = path.join(tmp, 'bin');
+      mkdirSync(bin, { recursive: true });
+      const ghLog = path.join(tmp, 'gh-calls.log');
+      const piLog = path.join(tmp, 'pi-calls.log');
+      writeFileSync(ghLog, ''); writeFileSync(piLog, '');
+      writeFileSync(path.join(bin, 'gh'), [
+        '#!/usr/bin/env node',
+        'const a = process.argv.slice(2);',
+        "const fs = require('node:fs');",
+        "const rec = () => fs.appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify(a) + '\\n');",
+        "const out = (s) => { process.stdout.write(s); process.exit(0); };",
+        "if (a[0] === 'issue' && a[1] === 'view') out(JSON.stringify({ number: 7, title: 't', body: '', labels: [] }));",
+        "if (a[0] === 'issue' && a[1] === 'list') out('[]');",
+        "if (a[0] === 'issue' && ['comment','create'].includes(a[1])) { rec(); process.exit(0); }",
+        'process.exit(1);',
+        '',
+      ].join('\n'));
+      chmodSync(path.join(bin, 'gh'), 0o755);
+      // 假 git：`status --porcelain` 总是吐一条脏记录（模拟人类未提交改动）
+      writeFileSync(path.join(bin, 'git'), [
+        '#!/usr/bin/env node',
+        'const a = process.argv.slice(2);',
+        "if (a[0] === 'status') { process.stdout.write(' M dirty.txt\\n'); process.exit(0); }",
+        "if (a[0] === 'rev-parse' && a.includes('--abbrev-ref')) { process.stdout.write('master\\n'); process.exit(0); }",
+        'process.exit(0);',
+        '',
+      ].join('\n'));
+      chmodSync(path.join(bin, 'git'), 0o755);
+      writeFileSync(path.join(bin, 'pi'), [
+        '#!/usr/bin/env node',
+        "const fs = require('node:fs');",
+        'const a = process.argv.slice(2);',
+        "fs.appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify(a) + '\\n');",
+        "process.stdout.write('implemented\\n');",
+        'process.exit(0);',
+        '',
+      ].join('\n'));
+      chmodSync(path.join(bin, 'pi'), 0o755);
+      const run = (extraEnv = {}) => {
+        const r = spawnSync('node', [path.join(tmp, '.agent/pipeline.mjs'), 'run', '--issue', '7'], {
+          cwd: tmp, encoding: 'utf8', stdio: 'pipe',
+          env: { ...process.env, PATH: bin + path.delimiter + (process.env.PATH || ''), FAKE_GH_LOG: ghLog, FAKE_PI_LOG: piLog, TEST_SKIP: '1', ...extraEnv },
+        });
+        return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
+      };
+      const piCalls = () => readFileSync(piLog, 'utf8').split('\n').filter(Boolean).length;
+      const p = [];
+      // 基线：同一份「脏」在默认设置下被拒绝
+      const strict = run();
+      if (piCalls() !== 0) p.push('默认设置下脏工作区不应调用 pi');
+      if (strict.code === 0) p.push('默认设置下脏工作区应非零退出');
+      // 显式承担风险 → 检查被跳过，但警告必须醒目
+      const allowed = run({ AGENT_ALLOW_DIRTY: '1' });
+      if (piCalls() === 0) p.push('AGENT_ALLOW_DIRTY=1 时检查应被跳过（pi 应被调用）');
+      if (!/AGENT_ALLOW_DIRTY=1：已按用户请求忽略脏工作区检查/.test(allowed.err)) p.push('AGENT_ALLOW_DIRTY=1 未在终端留醒目警告');
+      const localLog = path.join(tmp, '.agent/logs/issue-7.md');
+      const logText = existsSync(localLog) ? readFileSync(localLog, 'utf8') : '';
+      if (!/已按用户请求忽略脏工作区/.test(logText)) p.push('AGENT_ALLOW_DIRTY=1 未在日志写明「已按用户请求忽略脏工作区」');
+      p.length ? fail(`AGENT_ALLOW_DIRTY 逃生门 (18e): ${p.join('; ')}`)
+        : ok('AGENT_ALLOW_DIRTY 逃生门 (18e): 默认脏工作区拒绝开工（pi 零调用）；=1 时跳过检查但终端与日志均留「已按用户请求忽略脏工作区」警告');
+    } catch (e) {
+      fail(`AGENT_ALLOW_DIRTY 逃生门 (18e): ${e.message}`);
+    } finally { rmSync(tmp, { recursive: true, force: true }); }
+  }
+  // 18f. 离线端到端·**watch 路径**：脏工作区不能用「失败」语义（needs_human + 上报）处理，
+  //      而要走**等待轮**（本 tick 跳过、不改 status、下一 tick 重新拾取）。
+  //      这里跑真实 `watch --once`（真 git + 假 gh/pi）。
+  {
+    const tmp = mkdtempSync(path.join(os.tmpdir(), 'agent-dirty-watch-'));
+    try {
+      const g = (cwd, ...args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: 'pipe' }).trim();
+      mkdirSync(path.join(tmp, '.agent'), { recursive: true });
+      copyFileSync(path.join(ROOT, 'templates/pipeline.mjs'), path.join(tmp, '.agent/pipeline.mjs'));
+      copyFileSync(path.join(ROOT, 'templates/lib.mjs'), path.join(tmp, '.agent/lib.mjs'));
+      writeFileSync(path.join(tmp, '.agent/state.json'), '{}');
+      writeFileSync(path.join(tmp, '.agent/config.json'), JSON.stringify({ upstream: 'acme/agent-dev-team', feedbackOptIn: true }, null, 2));
+      writeFileSync(path.join(tmp, '.gitignore'), '.agent/\nbin/\n*.log\n');
+      writeFileSync(path.join(tmp, 'notes.txt'), 'line1\n');
+      g(tmp, 'init', '-b', 'master');
+      g(tmp, 'config', 'user.email', 'agent@test.local');
+      g(tmp, 'config', 'user.name', 'Agent Test');
+      g(tmp, 'add', '-A');
+      g(tmp, 'commit', '-m', 'base');
+      writeFileSync(path.join(tmp, 'notes.txt'), 'line1\nhuman wip\n');
+      const diffBefore = g(tmp, 'diff');
+
+      const bin = path.join(tmp, 'bin');
+      mkdirSync(bin, { recursive: true });
+      const ghLog = path.join(tmp, 'gh-calls.log');
+      const piLog = path.join(tmp, 'pi-calls.log');
+      writeFileSync(ghLog, ''); writeFileSync(piLog, '');
+      writeFileSync(path.join(bin, 'gh'), [
+        '#!/usr/bin/env node',
+        'const a = process.argv.slice(2);',
+        "const fs = require('node:fs');",
+        "const rec = () => fs.appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify(a) + '\\n');",
+        "const out = (s) => { process.stdout.write(s); process.exit(0); };",
+        "if (a[0] === 'issue' && a[1] === 'list') out(JSON.stringify([{ number: 7, title: 't', body: '', labels: ['agent-approved'] }]));",
+        "if (a[0] === 'issue' && a[1] === 'view') out(JSON.stringify({ number: 7, title: 't', body: '', labels: [] }));",
+        "if (a[0] === 'issue' && ['comment','create'].includes(a[1])) { rec(); process.exit(0); }",
+        "if (a[0] === 'pr' && a[1] === 'list') out('[]');",
+        'process.exit(1);',
+        '',
+      ].join('\n'));
+      chmodSync(path.join(bin, 'gh'), 0o755);
+      writeFileSync(path.join(bin, 'pi'), [
+        '#!/usr/bin/env node',
+        "const fs = require('node:fs');",
+        'const a = process.argv.slice(2);',
+        "fs.appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify(a) + '\\n');",
+        "process.stdout.write('implemented\\n');",
+        'process.exit(0);',
+        '',
+      ].join('\n'));
+      chmodSync(path.join(bin, 'pi'), 0o755);
+
+      const r = spawnSync('node', [path.join(tmp, '.agent/pipeline.mjs'), 'watch', '--once'], {
+        cwd: tmp, encoding: 'utf8', stdio: 'pipe',
+        env: { ...process.env, PATH: bin + path.delimiter + (process.env.PATH || ''), FAKE_GH_LOG: ghLog, FAKE_PI_LOG: piLog, TEST_SKIP: '1' },
+      });
+      const p = [];
+      const calls = readFileSync(ghLog, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+      if ((r.status ?? 1) !== 0) p.push(`watch --once 应在等待轮后正常退出（实得 exit ${r.status}: ${String(r.stderr || '').split('\n').slice(-2).join(' ')}）`);
+      if (readFileSync(piLog, 'utf8').trim() !== '') p.push('脏工作区时 watch 不应调用 pi');
+      if (calls.filter(a => a[0] === 'issue' && a[1] === 'comment').length !== 1) p.push(`issue 提示评论期望 1 条实得 ${calls.filter(a => a[0] === 'issue' && a[1] === 'comment').length}`);
+      if (calls.some(a => a[0] === 'issue' && a[1] === 'create')) p.push('等待轮不应上报上游 [skill-feedback]');
+      let st = {};
+      try { st = JSON.parse(readFileSync(path.join(tmp, '.agent/state.json'), 'utf8')); } catch { p.push('state.json 不可解析'); }
+      if (st['7']?.status !== undefined) p.push(`等待轮不得改 state status（实得 ${JSON.stringify(st['7']?.status)}）`);
+      if (st['7']?.error) p.push(`等待轮不得写 state.error: ${st['7'].error}`);
+      let branchExists = true;
+      try { g(tmp, 'rev-parse', '--verify', 'agent/7'); } catch { branchExists = false; }
+      if (branchExists) p.push('脏工作区时 watch 不应创建 agent/7 分支');
+      if (g(tmp, 'diff') !== diffBefore) p.push('watch 路径下人类改动被改动了（前后的 git diff 不一致）');
+      p.length ? fail(`脏工作区·watch 等待轮端到端 (18f): ${p.join('; ')}`)
+        : ok('脏工作区·watch 等待轮端到端 (18f): watch --once 正常退出、state 无 status/error（下一 tick 会重新拾取）、无 needs_human、无上游 feedback、pi 零调用、无分支创建、文件不变');
+    } catch (e) {
+      fail(`脏工作区·watch 等待轮端到端 (18f): ${e.message}`);
+    } finally { rmSync(tmp, { recursive: true, force: true }); }
+  }
+}
+
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);
